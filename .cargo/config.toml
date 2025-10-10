@@ -1,0 +1,7 @@
+[build]
+target = "armv7-unknown-linux-musleabi"
+
+[target.armv7-unknown-linux-musleabi]
+linker = "armv7l-unknown-linux-musleabi-gcc"
+# musl 默认就是静态，下面这行可写可不写
+rustflags = ["-C", "target-feature=+crt-static"]
