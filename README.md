@@ -1,7 +1,8 @@
 ## zixc rust开发环境
 
-适用于zxic的设备比如u10l/mf936 构建rust程序，无需buildroot
-使用musl构建静态链接的binary 
+- 适用于zxic的设备 比如u10l/mf936 
+- 构建rust程序，无需buildroot
+- 使用musl构建静态链接的binary 
 
 
 ## 使用构建方法
