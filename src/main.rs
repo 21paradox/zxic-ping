@@ -1,6 +1,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 use std::env;
+use daemonize::Daemonize;
 
 const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60;
@@ -8,16 +9,24 @@ const MAX_FAILURES: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    
+    // 检查是否需要后台运行
+    if args.iter().any(|arg| arg == "--background" || arg == "-b") {
+        daemonize_simple();
+    }
+    let mut is_prod = false;
+    if args.iter().any(|arg| arg == "--isprod") {
+       is_prod = true;
+    }
+    
     let target_ip = get_target_ip();
-    let is_prod = env::var("ISPROD").is_ok();
     
     if !is_prod {
         println!("Network monitor started for {}", target_ip);
         println!("Ping interval: {} seconds", PING_INTERVAL);
         println!("Reboot after {} consecutive failures", MAX_FAILURES);
-        println!("Run with ISPROD=1 environment variable to suppress console output");
-        println!("Usage: {} [TARGET_IP] or set TARGET_IP environment variable", 
-                 env::args().next().unwrap_or_default());
+        println!("Usage: {} [TARGET_IP] [--background] [--isprod]", args[0]);
     }
     
     log_message(&format!("Network monitor started for {}", target_ip), is_prod);
@@ -47,26 +56,36 @@ fn main() {
     }
 }
 
+fn daemonize_simple() {
+    let dev_null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .expect("cannot open /dev/null");
+
+    Daemonize::new()
+        .stdout(dev_null.try_clone().unwrap())
+        .stderr(dev_null)
+        .start()
+        .expect("daemonize failed");
+}
+
 fn get_target_ip() -> String {
-    // 优先级: 命令行参数 > 环境变量 > 默认值
     let args: Vec<String> = env::args().collect();
     
-    // 检查命令行参数
-    if args.len() > 1 {
-        let ip = &args[1];
-        if !ip.is_empty() {
-            return ip.clone();
+    // 跳过程序名和 --background 参数
+    for arg in &args[1..] {
+        if !arg.starts_with("--") {
+            return arg.clone();
         }
     }
     
-    // 检查环境变量
     if let Ok(env_ip) = env::var("TARGET_IP") {
         if !env_ip.is_empty() {
             return env_ip;
         }
     }
     
-    // 使用默认值
     DEFAULT_TARGET_IP.to_string()
 }
 
@@ -107,7 +126,6 @@ fn reboot_system(is_prod: bool) {
 }
 
 fn log_message(message: &str, is_prod: bool) {
-    // 只有在非生产环境才输出到控制台
     if !is_prod {
         println!("{}", message);
     }
