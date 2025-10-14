@@ -5,14 +5,15 @@ use std::process::{Command, Stdio};
 use std::fs;
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use daemonize::Daemonize;
 
 const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
 const CPU_CHECK_INTERVAL: u64 = 30; // CPU检查间隔30秒
 const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
-const MAX_FAILURES: u32 = 3;
+const MAX_FAILURES: u32 = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // CPU占用率监控配置
@@ -27,8 +28,9 @@ const UDP_TIMEOUT: Duration = Duration::from_secs(2); // UDP发送超时时间
 
 // 信号监听配置
 const SIGNAL_LISTEN_PORT: u16 = 1300; // 信号监听端口
-const RESTART_SIGNAL: &[u8] = b"RESTART_ADBD"; // 重启信号
-const KILL_SIGNAL: &[u8] = b"KILL_ADBD"; // 重启信号
+const RESTART_SIGNAL_ADBD: &[u8] = b"RESTART_ADBD";
+const KILL_SIGNAL_ADBD: &[u8] = b"KILL_ADBD"; 
+const RESTART_SIGNAL_SERVER: &[u8] = b"RESTART_SERVER";
 
 
 #[derive(Debug, Clone)]
@@ -60,6 +62,29 @@ impl CpuStats {
     }
 }
 
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum ServerCmd {
+    None      = 0,
+    RestartADB   = 1,
+    KillADB      = 2,
+    RestartSERVER   = 3,
+}
+
+impl ServerCmd {
+    fn store(&self, atomic: &AtomicU8) {
+        atomic.store(*self as u8, Ordering::Relaxed)
+    }
+    fn load(atomic: &AtomicU8) -> Self {
+        match atomic.load(Ordering::Relaxed) {
+            1 => ServerCmd::RestartADB,
+            2 => ServerCmd::KillADB,
+            3 => ServerCmd::RestartSERVER,
+            _ => ServerCmd::None,
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     
@@ -85,16 +110,18 @@ fn main() {
     log_message(&format!("Network monitor started for {}", target_ip), is_prod);
 
     // 创建共享标志用于强制重启
-    let force_restart_adbd = Arc::new(AtomicBool::new(false));
-    let force_kill_adbd = Arc::new(AtomicBool::new(false));
+    let server_cmd = Arc::new(AtomicU8::new(ServerCmd::None as u8));
     
     // 启动信号监听线程
-    let signal_flag_restart = Arc::clone(&force_restart_adbd);
-    let signal_flag_kill = Arc::clone(&force_kill_adbd);
-    let is_prod_signal = is_prod;
-    thread::spawn(move || {
-        listen_for_restart_signal(signal_flag_restart, signal_flag_kill, is_prod_signal);
-    });
+    let server_cmd_clone = Arc::clone(&server_cmd);
+
+    // let is_prod_signal = is_prod;
+    // thread::spawn(move || {
+    //     listen_for_signal(server_cmd_clone, is_prod_signal);
+    // });
+    let signal_sock = UdpSocket::bind(("0.0.0.0", SIGNAL_LISTEN_PORT))
+                      .expect("bind signal port");
+    signal_sock.set_nonblocking(true).expect("set_nonblocking");
     
     let mut failure_count = 0;
     let mut high_load_mode = false;
@@ -115,40 +142,75 @@ fn main() {
             }
         }
     };
+
+    thread::sleep(Duration::from_secs(2));
     restore_network_parameters(is_prod);
     
+    let mut buf = [0u8; 64];
     loop {
         let now = Instant::now();
-
-        // 检查是否需要强制重启adbd
-        if force_restart_adbd.load(Ordering::Relaxed) {
-            log_message("🔄 Received force restart signal, restarting adbd...", is_prod);
-            force_restart_adbd.store(false, Ordering::Relaxed);
-            
-            match force_restart_adbd_process(is_prod) {
-                Ok(_) => {
-                    log_message("✅ adbd force restarted successfully", is_prod);
-                    send_udp_notification("ADBD_FORCE_RESTARTED", target_ip.clone(), is_prod);
+        match signal_sock.recv_from(&mut buf) {
+            Ok((size, src)) => {
+                let received = &buf[..size];
+                        
+                if received == RESTART_SIGNAL_ADBD {
+                    log_message(&format!("📨 Received restart signal from {}", src), is_prod);
+                    ServerCmd::RestartADB.store(&server_cmd_clone);
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
+                } else if received == KILL_SIGNAL_ADBD {
+                    log_message(&format!("📨 Received kill signal from {}", src), is_prod);
+                    ServerCmd::KillADB.store(&server_cmd_clone);
+                            
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
+                } else if received == RESTART_SIGNAL_SERVER {
+                    log_message(&format!("📨 Received reboot signal from {}", src), is_prod);
+                    ServerCmd::RestartSERVER.store(&server_cmd_clone);
+                            
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
                 }
-                Err(e) => {
-                    log_message(&format!("❌ Failed to force restart adbd: {}", e), is_prod);
-                }
+                // 清空缓冲区
+                buf.fill(0);
+            }
+            Err(e) => {
+                // if !is_prod {
+                //     log_message(&format!("❌ Signal listener error: {}", e), is_prod);
+                // }
             }
         }
 
-        if force_kill_adbd.load(Ordering::Relaxed) {
-            log_message("🔄 Received force kill signal, killing adbd...", is_prod);
-            force_kill_adbd.store(false, Ordering::Relaxed);
-            
-            match force_kill_adbd_process(is_prod) {
-                Ok(_) => {
-                    log_message("✅ adbd force restarted successfully", is_prod);
-                    send_udp_notification("ADBD_FORCE_KILLED", target_ip.clone(), is_prod);
-                }
-                Err(e) => {
-                    log_message(&format!("❌ Failed to force restart adbd: {}", e), is_prod);
+        match ServerCmd::load(&server_cmd) {
+            ServerCmd::RestartADB => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                match force_restart_adbd_process(is_prod) {
+                    Ok(_) => {
+                        log_message("✅ adbd force restarted successfully", is_prod);
+                        send_udp_notification("ADBD_FORCE_RESTARTED", target_ip.clone(), is_prod);
+                    }
+                    Err(e) => {
+                        log_message(&format!("❌ Failed to force restart adbd: {}", e), is_prod);
+                    }
                 }
             }
+            ServerCmd::KillADB => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                match force_kill_adbd_process(is_prod) {
+                    Ok(_) => {
+                        log_message("✅ adbd force restarted successfully", is_prod);
+                        send_udp_notification("ADBD_FORCE_KILLED", target_ip.clone(), is_prod);
+                    }
+                    Err(e) => {
+                        log_message(&format!("❌ Failed to force restart adbd: {}", e), is_prod);
+                    }
+                }
+            }
+            ServerCmd::RestartSERVER => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                reboot_system(is_prod);
+            }
+            ServerCmd::None => {}
         }
         
         // CPU占用率检查 - 每30秒一次
@@ -411,7 +473,7 @@ fn reboot_system(is_prod: bool) {
     let _ = Command::new("/sbin/reboot").status();
     
     log_message("All reboot attempts failed! Continuing monitoring...", is_prod);
-    thread::sleep(Duration::from_secs(PING_INTERVAL));
+    // thread::sleep(Duration::from_secs(PING_INTERVAL));
 }
 
 
@@ -455,49 +517,48 @@ fn log_message(message: &str, is_prod: bool) {
 }
  
 // 监听重启信号的轻量级UDP服务器
-fn listen_for_restart_signal(flagrestart: Arc<AtomicBool>,flagkill: Arc<AtomicBool>, is_prod: bool) {
-    match UdpSocket::bind(("0.0.0.0", SIGNAL_LISTEN_PORT)) {
-        Ok(socket) => {
-            log_message(&format!("📡 Signal listener started on port {}", SIGNAL_LISTEN_PORT), is_prod);
+// fn listen_for_signal(cmd: Arc<AtomicU8>, is_prod: bool) {
+//     match UdpSocket::bind(("0.0.0.0", SIGNAL_LISTEN_PORT)) {
+//         Ok(socket) => {
+//             log_message(&format!("📡 Signal listener started on port {}", SIGNAL_LISTEN_PORT), is_prod);
             
-            let mut buf = [0u8; 64];
+//             let mut buf = [0u8; 64];
             
-            loop {
-                match socket.recv_from(&mut buf) {
-                    Ok((size, src)) => {
-                        let received = &buf[..size];
+//             loop {
+//                 match socket.recv_from(&mut buf) {
+//                     Ok((size, src)) => {
+//                         let received = &buf[..size];
                         
-                        if received == RESTART_SIGNAL {
-                            log_message(&format!("📨 Received restart signal from {}", src), is_prod);
-                            flagrestart.store(true, Ordering::Relaxed);
+//                         if received == RESTART_SIGNAL_ADBD {
+//                             log_message(&format!("📨 Received restart signal from {}", src), is_prod);
+//                             ServerCmd::RestartADB.store(&cmd);
+//                             // 发送确认响应
+//                             let _ = socket.send_to(b"OK", src);
+//                         }
+//                         if received == KILL_SIGNAL_ADBD {
+//                             log_message(&format!("📨 Received kill signal from {}", src), is_prod);
+//                             ServerCmd::KillADB.store(&cmd);
                             
-                            // 发送确认响应
-                            let _ = socket.send_to(b"OK", src);
-                        }
-                        if received == KILL_SIGNAL {
-                            log_message(&format!("📨 Received kill signal from {}", src), is_prod);
-                            flagkill.store(true, Ordering::Relaxed);
-                            
-                            // 发送确认响应
-                            let _ = socket.send_to(b"OK", src);
-                        }
-                    }
-                    Err(e) => {
-                        if !is_prod {
-                            log_message(&format!("❌ Signal listener error: {}", e), is_prod);
-                        }
-                    }
-                }
+//                             // 发送确认响应
+//                             let _ = socket.send_to(b"OK", src);
+//                         }
+//                     }
+//                     Err(e) => {
+//                         if !is_prod {
+//                             log_message(&format!("❌ Signal listener error: {}", e), is_prod);
+//                         }
+//                     }
+//                 }
                 
-                // 清空缓冲区
-                buf.fill(0);
-            }
-        }
-        Err(e) => {
-            log_message(&format!("❌ Failed to start signal listener: {}", e), is_prod);
-        }
-    }
-}
+//                 // 清空缓冲区
+//                 buf.fill(0);
+//             }
+//         }
+//         Err(e) => {
+//             log_message(&format!("❌ Failed to start signal listener: {}", e), is_prod);
+//         }
+//     }
+// }
 
 
 // 强制重启adbd进程
