@@ -1,18 +1,20 @@
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::env;
 use std::process::{Command, Stdio};
 use std::fs;
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::UNIX_EPOCH;
 
 use daemonize::Daemonize;
 
 const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
+const DAY_INTERVAL: u64 = 86400; // 网络检查间隔60秒
 const CPU_CHECK_INTERVAL: u64 = 30; // CPU检查间隔30秒
-const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
+// const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
 const MAX_FAILURES: u32 = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -31,6 +33,7 @@ const SIGNAL_LISTEN_PORT: u16 = 1300; // 信号监听端口
 const RESTART_SIGNAL_ADBD: &[u8] = b"RESTART_ADBD";
 const KILL_SIGNAL_ADBD: &[u8] = b"KILL_ADBD"; 
 const RESTART_SIGNAL_SERVER: &[u8] = b"RESTART_SERVER";
+const SIGNAL_PING: &[u8] = b"PING";
 
 
 #[derive(Debug, Clone)]
@@ -124,11 +127,12 @@ fn main() {
     signal_sock.set_nonblocking(true).expect("set_nonblocking");
     
     let mut failure_count = 0;
-    let mut high_load_mode = false;
+    let mut high_load_count = 0;
     let mut last_cpu_check = Instant::now();
     let mut last_network_check = Instant::now();
     // let mut last_udp_notification = Instant::now();
-    let mut last_adbd_check = Instant::now();
+    // let mut last_adbd_check = Instant::now();
+    let mut last_log_prune = Instant::now();
     
     // 初始化CPU统计
     let mut prev_cpu_stats = match get_cpu_stats() {
@@ -143,7 +147,7 @@ fn main() {
         }
     };
 
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(10));
     restore_network_parameters(is_prod);
     
     let mut buf = [0u8; 64];
@@ -169,6 +173,9 @@ fn main() {
                     ServerCmd::RestartSERVER.store(&server_cmd_clone);
                             
                     // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
+                } else if received == SIGNAL_PING {
+                    log_message(&format!("📨 Received ping signal from {}", src), is_prod);                            
                     let _ = signal_sock.send_to(b"OK", src);
                 }
                 // 清空缓冲区
@@ -221,31 +228,37 @@ fn main() {
                     prev_cpu_stats = current_cpu_stats;
                     
                     if usage > CPU_USAGE_THRESHOLD {
-                        if !high_load_mode {
+                        if high_load_count == 0 {
                             log_message(&format!("High CPU usage detected: {:.1}%, entering high load mode", usage), is_prod);
-                            high_load_mode = true;
+                            high_load_count += 1;
                             // current_cpu_interval = HIGH_LOAD_CHECK_INTERVAL;
                             // 在高负载模式下，可以添加额外的保护措施
-                            //throttle_network_parameters(is_prod);
                             send_udp_notification(&format!("HIGH_LOAD_ENTER: CPU={:.1}%", usage), target_ip.clone(), is_prod);
                         } else {
                             log_message(&format!("High load mode active - CPU usage: {:.1}%", usage), is_prod);
+                            high_load_count += 1;
                             send_udp_notification(&format!("HIGH_LOAD: CPU={:.1}%", usage), target_ip.clone(), is_prod);
+                            if high_load_count == 3 {
+                                throttle_network_parameters(is_prod);
+                            }
                         }
                         // last_udp_notification = now;
                         
                     } else {
-                        if high_load_mode {
+                        if high_load_count > 0 {
                             log_message(&format!("CPU usage normalized: {:.1}%, returning to normal mode", usage), is_prod);
-                            high_load_mode = false;
+
                             // current_cpu_interval = NORMAL_CHECK_INTERVAL;
-                            //restore_network_parameters(is_prod);
+                            if high_load_count >= 3 {
+                                restore_network_parameters(is_prod);
+                            }
+                            high_load_count = 0;
                             clear_page_cache(is_prod);
 
                             // 退出高负载模式时发送通知
                             send_udp_notification(&format!("HIGH_LOAD_EXIT: CPU={:.1}%", usage), target_ip.clone(), is_prod);
                         } else {
-                            log_message(&format!("CPU usage normal: {:.1}%", usage), is_prod);
+                            //log_message(&format!("CPU usage normal: {:.1}%", usage), is_prod);
                         }
                     }
                 }
@@ -279,20 +292,33 @@ fn main() {
         }
 
        // adbd进程检查 - 每10秒一次
-        if now.duration_since(last_adbd_check) >= Duration::from_secs(ADBD_CHECK_INTERVAL) {
-            match check_and_start_adbd(is_prod) {
-                Ok(restarted) => {
-                    if restarted {
-                        log_message("✅ adbd process was restarted", is_prod);
-                        // 发送adbd重启通知
-                        send_udp_notification("ADBD_RESTARTED", target_ip.clone() ,is_prod);
-                    }
-                }
-                Err(e) => {
-                    log_message(&format!("❌ adbd check failed: {}", e), is_prod);
-                }
+        // if now.duration_since(last_adbd_check) >= Duration::from_secs(ADBD_CHECK_INTERVAL) {
+        //     match check_and_start_adbd(is_prod) {
+        //         Ok(restarted) => {
+        //             if restarted {
+        //                 log_message("✅ adbd process was restarted", is_prod);
+        //                 // 发送adbd重启通知
+        //                 send_udp_notification("ADBD_RESTARTED", target_ip.clone() ,is_prod);
+        //             }
+        //         }
+        //         Err(e) => {
+        //             log_message(&format!("❌ adbd check failed: {}", e), is_prod);
+        //         }
+        //     }
+        //     last_adbd_check = now;
+        // }
+
+        if now.duration_since(last_log_prune) >= Duration::from_secs(DAY_INTERVAL) {
+            if let Err(e) = Command::new("sh")
+            .arg("-c")
+            .arg("echo '' > /etc_rw/zxping.log")
+            .status() 
+                {
+                log_message(&format!("Failed to clear zxping.log: {}", e), is_prod);
+            } else {
+                log_message("zxping.log cleared", is_prod);
             }
-            last_adbd_check = now;
+            last_log_prune = now;
         }
 
         // 睡眠1秒后继续检查，避免忙等待
@@ -346,27 +372,27 @@ fn calculate_cpu_usage(prev: &CpuStats, current: &CpuStats) -> f32 {
     }
 }
 
-// fn throttle_network_parameters(is_prod: bool) {
-//     // 调整TCP参数来减轻网络栈负担
-//     let commands = [
-//         // "echo 800 > /proc/sys/net/core/netdev_max_backlog",
-//         // "echo 3000 > /proc/sys/net/unix/max_dgram_qlen",
-//         // "echo 100 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
+fn throttle_network_parameters(is_prod: bool) {
+    // 调整TCP参数来减轻网络栈负担
+    let commands = [
+        "echo 800 > /proc/sys/net/core/netdev_max_backlog",
+        "echo 3000 > /proc/sys/net/unix/max_dgram_qlen",
+        //"echo 100 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
 
-//         // "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
-//         // "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
-//         // "echo 5 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
-//         // "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
-//         // "echo 3800 > /proc/sys/net/nf_conntrack_max",
-//     ];
-//     for cmd in commands.iter() {
-//         if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
-//             if !is_prod {
-//                 log_message(&format!("Failed to adjust network parameter {}: {}", cmd, e), is_prod);
-//             }
-//         }
-//     }
-// }
+        "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
+        "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
+        "echo 5 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
+        "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
+        "echo 3800 > /proc/sys/net/nf_conntrack_max",
+    ];
+    for cmd in commands.iter() {
+        if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
+            if !is_prod {
+                log_message(&format!("Failed to adjust network parameter {}: {}", cmd, e), is_prod);
+            }
+        }
+    }
+}
 
 fn restore_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
@@ -380,10 +406,13 @@ fn restore_network_parameters(is_prod: bool) {
         "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
         "echo 1800 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
+
         "echo 15 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout",
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout_stream",
         "echo 20 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_close",
         "echo 4800 > /proc/sys/net/nf_conntrack_max",
+
+        //"echo 0 > /proc/sys/net/ipv4/tcp_window_scaling"
     ];
     for cmd in commands.iter() {
         if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
@@ -512,7 +541,11 @@ fn send_udp_notification(message: &str, addr: String, is_prod: bool) {
 
 fn log_message(message: &str, is_prod: bool) {
     if !is_prod {
-        println!("{}", message);
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let timestamp = duration.as_secs();
+        println!("[{}] {}", timestamp, message);
     }
 }
  
@@ -563,7 +596,7 @@ fn log_message(message: &str, is_prod: bool) {
 
 // 强制重启adbd进程
 fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
-    log_message("Force restarting adbd process...", is_prod);
+    log_message("Force restart adbd process...", is_prod);
     
     // 1. 查找并杀死所有adbd进程
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -578,7 +611,7 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
                         // 修复：将 Cow<'_, str> 转换为 String
                         let pid = name_str.to_string();
                         // 杀死adbd进程
-                        let _ = Command::new("kill")
+                        let _ = Command::new("/bin/kill")
                             .arg("-9")
                             .arg(&pid)
                             .status();
@@ -590,20 +623,21 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
     }
     
     // 2. 等待一段时间确保进程完全终止
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_secs(3));
     
     // 3. 启动新的adbd进程
-    let status = Command::new("adbd")
+    let status = Command::new("/bin/adbd")
         .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
         .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
         .status()
-        .or_else(|_| {
-            Command::new("/bin/adbd")
-                .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
-                .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
-                .status()
-                .map_err(|e| format!("Failed to start adbd: {}", e))
-        });
+        .map_err(|e| format!("Failed to start adbd: {}", e));
+        // .or_else(|_| {
+        //     Command::new("/bin/adbd")
+        //         .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
+        //         .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
+        //         .status()
+        //         .map_err(|e| format!("Failed to start adbd: {}", e))
+        // });
     
     match status {
         Ok(_) => {
@@ -617,86 +651,86 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
 }
 
 // 同时修复 check_and_start_adbd 函数中的相同问题
-fn check_and_start_adbd(is_prod: bool) -> Result<bool, String> {
-    let mut adbd_found = false;
-    let mut adbd_pid = String::new();
+// fn check_and_start_adbd(is_prod: bool) -> Result<bool, String> {
+//     let mut adbd_found = false;
+//     let mut adbd_pid = String::new();
 
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
+//     if let Ok(entries) = fs::read_dir("/proc") {
+//         for entry in entries.flatten() {
+//             let file_name = entry.file_name();
+//             let name_str = file_name.to_string_lossy();
             
-            if name_str.chars().all(|c| c.is_ascii_digit()) {
-                let cmdline_path = format!("/proc/{}/cmdline", name_str);
-                if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
-                    if cmdline_content.contains("adbd") {
-                        adbd_found = true;
-                        // 修复：将 Cow<'_, str> 转换为 String
-                        adbd_pid = name_str.to_string();
+//             if name_str.chars().all(|c| c.is_ascii_digit()) {
+//                 let cmdline_path = format!("/proc/{}/cmdline", name_str);
+//                 if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
+//                     if cmdline_content.contains("adbd") {
+//                         adbd_found = true;
+//                         // 修复：将 Cow<'_, str> 转换为 String
+//                         adbd_pid = name_str.to_string();
                         
-                        let stat_path = format!("/proc/{}/stat", adbd_pid);
-                        if let Ok(stat_content) = fs::read_to_string(&stat_path) {
-                            let parts: Vec<&str> = stat_content.split_whitespace().collect();
-                            if parts.len() > 2 {
-                                let state = parts[2];
-                                if state == "R" || state == "S" {
-                                    if !is_prod {
-                                        log_message(&format!("adbd is running (PID: {}, State: {})", adbd_pid, state), is_prod);
-                                    }
-                                    return Ok(false);
-                                } else {
-                                    log_message(&format!("adbd process exists but state is {} (not running properly)", state), is_prod);
-                                    continue;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        return Err("Failed to read /proc directory".to_string());
-    }
+//                         let stat_path = format!("/proc/{}/stat", adbd_pid);
+//                         if let Ok(stat_content) = fs::read_to_string(&stat_path) {
+//                             let parts: Vec<&str> = stat_content.split_whitespace().collect();
+//                             if parts.len() > 2 {
+//                                 let state = parts[2];
+//                                 if state == "R" || state == "S" {
+//                                     if !is_prod {
+//                                         log_message(&format!("adbd is running (PID: {}, State: {})", adbd_pid, state), is_prod);
+//                                     }
+//                                     return Ok(false);
+//                                 } else {
+//                                     log_message(&format!("adbd process exists but state is {} (not running properly)", state), is_prod);
+//                                     continue;
+//                                 }
+//                             }
+//                         }
+//                         break;
+//                     }
+//                 }
+//             }
+//         }
+//     } else {
+//         return Err("Failed to read /proc directory".to_string());
+//     }
 
-    if adbd_found {
-        log_message(&format!("adbd process (PID: {}) exists but not in running state, attempting to restart...", adbd_pid), is_prod);
+//     if adbd_found {
+//         log_message(&format!("adbd process (PID: {}) exists but not in running state, attempting to restart...", adbd_pid), is_prod);
         
-        // 修复：这里也需要转换
-        if let Ok(_) = Command::new("kill")
-            .arg("-9")
-            .arg(&adbd_pid)
-            .status() 
-        {
-            log_message(&format!("Killed abnormal adbd process (PID: {})", adbd_pid), is_prod);
-            thread::sleep(Duration::from_secs(1));
-        }
-    } else {
-        log_message("adbd not found in /proc, attempting to start...", is_prod);
-    }
+//         // 修复：这里也需要转换
+//         if let Ok(_) = Command::new("kill")
+//             .arg("-9")
+//             .arg(&adbd_pid)
+//             .status() 
+//         {
+//             log_message(&format!("Killed abnormal adbd process (PID: {})", adbd_pid), is_prod);
+//             thread::sleep(Duration::from_secs(1));
+//         }
+//     } else {
+//         log_message("adbd not found in /proc, attempting to start...", is_prod);
+//     }
     
-    let status = Command::new("adbd")
-        .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
-        .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
-        .status()
-        .or_else(|_| {
-            Command::new("/bin/adbd")
-                .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
-                .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
-                .status()
-                .map_err(|e| format!("Failed to start adbd: {}", e))
-        });
+//     let status = Command::new("adbd")
+//         .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
+//         .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
+//         .status()
+//         .or_else(|_| {
+//             Command::new("/bin/adbd")
+//                 .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
+//                 .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
+//                 .status()
+//                 .map_err(|e| format!("Failed to start adbd: {}", e))
+//         });
     
-    match status {
-        Ok(_) => {
-            log_message("adbd started successfully", is_prod);
-            Ok(true)
-        }
-        Err(e) => {
-            Err(format!("Failed to start adbd: {}", e))
-        }
-    }
-}
+//     match status {
+//         Ok(_) => {
+//             log_message("adbd started successfully", is_prod);
+//             Ok(true)
+//         }
+//         Err(e) => {
+//             Err(format!("Failed to start adbd: {}", e))
+//         }
+//     }
+// }
 
 
 
