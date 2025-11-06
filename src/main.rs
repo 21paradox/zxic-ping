@@ -7,6 +7,7 @@ use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::UNIX_EPOCH;
+use std::net::SocketAddr;
 
 use daemonize::Daemonize;
 
@@ -152,7 +153,7 @@ fn main() {
     };
 
     thread::sleep(Duration::from_secs(30));
-    optimize_network_parameters(is_prod);
+    optimize_network_parameters(is_prod, target_ip.clone());
     
     let mut buf = [0u8; 64];
     loop {
@@ -503,8 +504,15 @@ fn get_br_network(is_prod: bool) -> String {
     "192.168.0.0/24".to_string()
 }
 
-fn optimize_network_parameters(is_prod: bool) {
+fn optimize_network_parameters(is_prod: bool, addr: String) {
     // 调整TCP参数来减轻网络栈负担
+    let ip_only = match addr.parse::<SocketAddr>() {
+        Ok(sock) => sock.ip().to_string(),
+        Err(_)   => {
+            log_message(&format!("invalid addr: {}", addr), is_prod);
+            return;
+        }
+    };
     let br_network = get_br_network(is_prod);
 
     let commands = [
@@ -528,17 +536,18 @@ fn optimize_network_parameters(is_prod: bool) {
 
     if !br_network.is_empty() {
         let ipt_cmds = [
-            "iptables -P INPUT ACCEPT",
-            "iptables -P FORWARD ACCEPT",
-            "iptables -P OUTPUT ACCEPT",
-            "iptables -F -t filter",
-            "iptables -F -t nat",
-            // "iptables -t nat -A POSTROUTING -s 192.168.0.2/32 -o wan1 -j MASQUERADE",
-            &format!("iptables -t nat -A POSTROUTING -s {} -o wan1 -j MASQUERADE", br_network),
-            "ip6tables -F",
+            "iptables -P INPUT ACCEPT".to_string(),
+            "iptables -P FORWARD ACCEPT".to_string(),
+            "iptables -P OUTPUT ACCEPT".to_string(),
+            "iptables -F -t filter".to_string(),
+            "iptables -F -t nat".to_string(),
+            // "iptables -t nat -A POSTROUTING -s 192.168.8.2/32 -o wan1 -j MASQUERADE",
+            format!("iptables -t nat -A POSTROUTING -s {}/32 -o wan1 -j MASQUERADE", ip_only),
+            //&format!("iptables -t nat -A POSTROUTING -s {} -o wan1 -j MASQUERADE", br_network),
+            "ip6tables -F".to_string(),
              //&format!("iptables -t nat -I POSTROUTING -s 192.168.0.2/32 -o wan1 -j SNAT --to-source {}", wan1_ip)
         ];
-        for cmd in ipt_cmds.iter() {
+        for cmd in &ipt_cmds {
             if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
                 if !is_prod {
                     log_message(&format!("Failed to adjust network parameter {}: {}", cmd, e), is_prod);
