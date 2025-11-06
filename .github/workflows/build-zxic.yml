@@ -52,7 +52,7 @@ jobs:
           name: Continuous ARM build
           body: |
             Auto-generated release from ${{ github.sha }}.
-          files: zxic_ping
+          files: target/armv7-unknown-linux-musleabi/release/zxic_ping
           prerelease: true          # 设为 false 即为正式版
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
