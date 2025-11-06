@@ -3,6 +3,7 @@ name: offline-build-via-nix-develop
 on:
   push:
     branches: [ master ]
+    tags: [ 'v*' ]  # 添加 tags 触发
   pull_request:
     branches: [ master ]
   workflow_dispatch:
