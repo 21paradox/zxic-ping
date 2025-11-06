@@ -24,12 +24,12 @@ jobs:
           nix_path: nixpkgs=${{ env.NIXPKGS_PIN }}
 
       # 3. 提前 vendor（如果仓库里没 vendor 目录）
-      - name: Vendor dependencies
-        run: |
-          nix develop --command bash -c '
-            mkdir -p vendor
-            cargo vendor --versioned-dirs > .cargo/config.toml
-          '
+      # - name: Vendor dependencies
+      #   run: |
+      #     nix develop --command bash -c '
+      #       mkdir -p vendor
+      #       cargo vendor --versioned-dirs > .cargo/config.toml
+      #     '
 
       # 4. 真正构建 —— 用 nix develop 环境，完全离线
       - name: Build in nix develop (offline)
