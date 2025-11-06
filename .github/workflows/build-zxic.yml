@@ -1,0 +1,45 @@
+name: offline-build-via-nix-develop
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  NIXPKGS_PIN: "github:NixOS/nixpkgs/nixos-unstable"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. 装 Nix + flakes
+      - uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          nix_path: nixpkgs=${{ env.NIXPKGS_PIN }}
+
+      # 3. 提前 vendor（如果仓库里没 vendor 目录）
+      - name: Vendor dependencies
+        run: |
+          nix develop --command bash -c '
+            mkdir -p vendor
+            cargo vendor --versioned-dirs > .cargo/config.toml
+          '
+
+      # 4. 真正构建 —— 用 nix develop 环境，完全离线
+      - name: Build in nix develop (offline)
+        run: |
+          nix develop --command bash -c '
+            cargo build --release --target armv7-unknown-linux-musleabi
+          '
+
+      # 5. 保存产物
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zxic-armv7-musleabi
+          path: target/armv7-unknown-linux-musleabi/release/zxic

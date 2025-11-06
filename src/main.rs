@@ -17,6 +17,8 @@ const CPU_CHECK_INTERVAL: u64 = 30; // CPU检查间隔30秒
 // const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
 const MAX_FAILURES: u32 = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_HIGH_LATENCY: u32 = 3;
+const HIGH_LATENCY_THRESHOLD: u128 = 50; // 50ms
 
 // CPU占用率监控配置
 const CPU_USAGE_THRESHOLD: f32 = 85.0; // CPU占用率阈值 80%
@@ -128,6 +130,8 @@ fn main() {
     
     let mut failure_count = 0;
     let mut high_load_count = 0;
+    let mut back_to_normal_load_count = 0;
+    let mut high_latency_count = 0;
     let mut last_cpu_check = Instant::now();
     let mut last_network_check = Instant::now();
     // let mut last_udp_notification = Instant::now();
@@ -147,8 +151,8 @@ fn main() {
         }
     };
 
-    thread::sleep(Duration::from_secs(10));
-    restore_network_parameters(is_prod);
+    thread::sleep(Duration::from_secs(30));
+    optimize_network_parameters(is_prod);
     
     let mut buf = [0u8; 64];
     loop {
@@ -242,6 +246,7 @@ fn main() {
                                 throttle_network_parameters(is_prod);
                             }
                         }
+                        back_to_normal_load_count = 0;
                         // last_udp_notification = now;
                         
                     } else {
@@ -249,14 +254,21 @@ fn main() {
                             log_message(&format!("CPU usage normalized: {:.1}%, returning to normal mode", usage), is_prod);
 
                             // current_cpu_interval = NORMAL_CHECK_INTERVAL;
-                            if high_load_count >= 3 {
-                                restore_network_parameters(is_prod);
-                            }
-                            high_load_count = 0;
-                            clear_page_cache(is_prod);
+                            back_to_normal_load_count += 1;
+                            let mut restoreflag = false;
 
+                            if back_to_normal_load_count >= 3 {
+                                restoreflag = true;
+                                high_load_count = 0;
+                                back_to_normal_load_count = 0;
+                            }
                             // 退出高负载模式时发送通知
                             send_udp_notification(&format!("HIGH_LOAD_EXIT: CPU={:.1}%", usage), target_ip.clone(), is_prod);
+
+                            if restoreflag {
+                                restore_network_parameters(is_prod);
+                                clear_page_cache(is_prod);
+                            }
                         } else {
                             //log_message(&format!("CPU usage normal: {:.1}%", usage), is_prod);
                         }
@@ -272,11 +284,32 @@ fn main() {
         // 网络连通性检查 - 根据负载模式调整间隔
         if now.duration_since(last_network_check) >= Duration::from_secs(PING_INTERVAL) {
             match check_connectivity(&target_ip, is_prod) {
-                true => {
-                    log_message(&format!("✓ Connection to {} successful", target_ip), is_prod);
+                (true, Some(connect_duration)) => {
+                    if connect_duration.as_millis() > HIGH_LATENCY_THRESHOLD {
+                        high_latency_count += 1;
+                        log_message(&format!("High latency detected: {}ms (> {}ms)", connect_duration.as_millis(), HIGH_LATENCY_THRESHOLD), is_prod);
+                        log_message(&format!("High latency count: {}/{}", high_latency_count, MAX_HIGH_LATENCY), is_prod);
+                
+                        if high_latency_count == MAX_HIGH_LATENCY {
+                            log_message(&format!("WARN: {} consecutive high latency connections detected", MAX_HIGH_LATENCY), is_prod);
+                            throttle_network_parameters(is_prod);
+                        }
+                    } else {
+                        // 延迟正常时重置计数器
+                        if high_latency_count == 3 {
+                          restore_network_parameters(is_prod);
+                        }
+                        high_latency_count = 0;
+                    }
                     failure_count = 0;
                 }
-                false => {
+                (true, None) => {
+                    // 连接成功但没有获取到时间（理论上不应该发生，但需要处理）
+                    log_message(&format!("✓ Connection to {} successful, but duration not measured", target_ip), is_prod);
+                    high_latency_count = 0;
+                    failure_count = 0;
+                }
+                (false, _) => {
                     log_message(&format!("✗ Connection to {} failed", target_ip), is_prod);
                     failure_count += 1;
                     log_message(&format!("Failure count: {}/{}", failure_count, MAX_FAILURES), is_prod);
@@ -309,11 +342,7 @@ fn main() {
         // }
 
         if now.duration_since(last_log_prune) >= Duration::from_secs(DAY_INTERVAL) {
-            if let Err(e) = Command::new("sh")
-            .arg("-c")
-            .arg("echo '' > /etc_rw/zxping.log")
-            .status() 
-                {
+            if let Err(e) = fs::write("/etc_rw/zxping.log", "") {
                 log_message(&format!("Failed to clear zxping.log: {}", e), is_prod);
             } else {
                 log_message("zxping.log cleared", is_prod);
@@ -396,6 +425,88 @@ fn throttle_network_parameters(is_prod: bool) {
 
 fn restore_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
+
+    let commands = [
+        "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
+        "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
+        "echo 10 > /proc/sys/net/ipv4/tcp_retries2",
+        "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
+        "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
+        "echo 1800 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
+        "echo 4800 > /proc/sys/net/nf_conntrack_max",
+    ];
+
+
+
+    for cmd in commands.iter() {
+        thread::sleep(Duration::from_millis(200));
+        if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
+            if !is_prod {
+                log_message(&format!("Failed to adjust network parameter {}: {}", cmd, e), is_prod);
+            }
+        }
+    }
+}
+// fn get_br_ip_address(is_prod: bool) -> String {
+//     // 方法1: 使用 ip 命令获取 wan1 接口的 IP
+//     if let Ok(output) = Command::new("ip")
+//         .args(["addr", "show", "br0"])
+//         .output() 
+//     {
+//         if output.status.success() {
+//             let output_str = String::from_utf8_lossy(&output.stdout);
+//             for line in output_str.lines() {
+//                 if line.trim().starts_with("inet ") {
+//                     let parts: Vec<&str> = line.trim().split_whitespace().collect();
+//                     if parts.len() >= 2 {
+//                         let ip_with_mask = parts[1];
+//                         if let Some(ip) = ip_with_mask.split('/').next() {
+//                             if !ip.is_empty() && ip != "127.0.0.1" {
+//                                 log_message(&format!("Found wan1 IP via ip command: {}", ip), is_prod);
+//                                 return ip.to_string();
+//                             }
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//     }
+
+//     log_message("Could not determine wan1 IP address", is_prod);
+//     String::new()
+// }
+
+fn get_br_network(is_prod: bool) -> String {
+    // 获取 br0 接口的网络地址 (如 192.168.0.0/24)
+    if let Ok(output) = Command::new("ip")
+        .args(["route", "show", "dev", "br0"])
+        .output() 
+    {
+        if output.status.success() {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            for line in output_str.lines() {
+                let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                // 查找类似 "192.168.0.0/24" 的网络路由
+                if parts.len() >= 1 && parts[0].contains('/') {
+                    let network = parts[0];
+                    if network != "default" && !network.starts_with("169.254") {
+                        log_message(&format!("Found br0 network: {}", network), is_prod);
+                        return network.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 如果无法获取网络地址，使用默认的 192.168.0.0/24
+    log_message("Could not determine br0 network, using default 192.168.0.0/24", is_prod);
+    "192.168.0.0/24".to_string()
+}
+
+fn optimize_network_parameters(is_prod: bool) {
+    // 调整TCP参数来减轻网络栈负担
+    let br_network = get_br_network(is_prod);
+
     let commands = [
         "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
         "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
@@ -414,6 +525,28 @@ fn restore_network_parameters(is_prod: bool) {
 
         //"echo 0 > /proc/sys/net/ipv4/tcp_window_scaling"
     ];
+
+    if !br_network.is_empty() {
+        let ipt_cmds = [
+            "iptables -P INPUT ACCEPT",
+            "iptables -P FORWARD ACCEPT",
+            "iptables -P OUTPUT ACCEPT",
+            "iptables -F -t filter",
+            "iptables -F -t nat",
+            // "iptables -t nat -A POSTROUTING -s 192.168.0.2/32 -o wan1 -j MASQUERADE",
+            &format!("iptables -t nat -A POSTROUTING -s {} -o wan1 -j MASQUERADE", br_network),
+            "ip6tables -F",
+             //&format!("iptables -t nat -I POSTROUTING -s 192.168.0.2/32 -o wan1 -j SNAT --to-source {}", wan1_ip)
+        ];
+        for cmd in ipt_cmds.iter() {
+            if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
+                if !is_prod {
+                    log_message(&format!("Failed to adjust network parameter {}: {}", cmd, e), is_prod);
+                }
+            }
+        }
+    }
+
     for cmd in commands.iter() {
         if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
             if !is_prod {
@@ -469,8 +602,16 @@ fn get_target_ip() -> String {
     DEFAULT_TARGET_IP.to_string()
 }
 
-fn check_connectivity(target_ip: &str, is_prod: bool) -> bool {
-    tcp_connect_check(target_ip, is_prod)
+fn check_connectivity(target_ip: &str, is_prod: bool) -> (bool, Option<std::time::Duration>) {
+    let start = Instant::now();
+    
+    match tcp_connect_check(target_ip, is_prod) {
+        true => {
+            let duration = start.elapsed();
+            (true, Some(duration))
+        }
+        false => (false, None)
+    }
 }
 
 fn tcp_connect_check(target_ip: &str, is_prod: bool) -> bool {

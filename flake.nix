@@ -11,59 +11,64 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay,  ... }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
+        # 通用配置
         overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs {
-          inherit system overlays;
+        basePkgs = import nixpkgs { inherit system overlays; };
+        
+        rustVersion = "1.89.0";
+        rustToolchain = basePkgs.rust-bin.stable.${rustVersion}.default.override {
+          extensions = [ "rust-src" ];
+          targets = [ "armv7-unknown-linux-musleabi" ];
         };
-        armpkgs = import nixpkgs {
+        
+        # 交叉编译配置
+        armPkgs = import nixpkgs {
           inherit system overlays;
           crossSystem = { config = "armv7l-unknown-linux-musleabi"; };
         };
-
-        rustVersion = "1.89.0";
-        rust1 = pkgs.rust-bin.stable.${rustVersion}.default.override {
-            extensions = [ "rust-src" "rust-std" ];
-            targets = [
-             "armv7-unknown-linux-musleabi"
-            ];
-        };
+        crossGcc = armPkgs.stdenv.cc;
         
-        crossGcc = armpkgs.stdenv.cc;
-
-        # 在 let 块中处理 pkgsCross 属性名
-        pkgsCrossNames = pkgs.lib.concatStringsSep "\n" (builtins.attrNames pkgs.pkgsCross);
-      in
-
-      {
-        # android entry
-        devShells.zxic = pkgs.mkShell rec {
-          nativeBuildInputs = [
-              rust1
-              pkgs.pkg-config
-           ];
-          buildInputs = [];
-
+        # 共享的构建输入
+        commonNativeInputs = [
+          rustToolchain
+          basePkgs.pkg-config
+          crossGcc
+          basePkgs.cacert  
+          basePkgs.bashInteractive
+        ];
+        
+        # 共享的环境变量
+        commonEnv = {
           LANG = "C.UTF-8";
           LC_ALL = "C.UTF-8";
-          PATH = pkgs.lib.makeBinPath [ crossGcc ];
-
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABI_LINKER  = "${crossGcc}/bin/armv7l-unknown-linux-musleabi-gcc";
-
-          # 设置编译器标志
-          shellHook = ''
-            unset NIX_CFLAGS_COMPILE
-            unset NIX_CFLAGS_COMPILE_FOR_BUILD
-        
-            echo "${pkgsCrossNames}"
-            echo "${crossGcc}"
-            echo "================================"
-          '';
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABI_LINKER = "${crossGcc}/bin/armv7l-unknown-linux-musleabi-gcc";
+          # CURL_CA_BUNDLE      = "${basePkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          # CARGO_NET_CAINFO    = "${basePkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          SSL_CERT_FILE = "${basePkgs.cacert}/etc/ssl/certs/ca-bund";
         };
 
-        #devShells.default = pkgs.mkShell {};
+        # 开发环境
+        mkZxicShell = extraInputs: basePkgs.mkShell (commonEnv // {
+          nativeBuildInputs = commonNativeInputs ++ ([]);
+          buildInputs = [ ];
+          
+          shellHook = ''
+            echo "zxic development environment (ARM cross-compilation)"
+            echo "Build: nix build .#zxic"
+            export SSL_CERT_FILE="${basePkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+            echo $SSL_CERT_FILE
+          '';
+        });
+
+      in
+      {
+        devShells = {
+          zxic = mkZxicShell [ ];
+          default = mkZxicShell [ ];
+        };
       }
     );
 }
