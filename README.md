@@ -15,7 +15,7 @@ cargo build --release  --target=armv7-unknown-linux-musleabi
 运行方式
 ```sh
 adb push ./target/armv7-unknown-linux-musleabi/release/zxic_ping /etc_rw/zxic_ping
-/etc_rw/zxic_ping 192.168.0.1:80
+/etc_rw/zxic_ping 192.168.0.2:80 --background
 ```
 
 
