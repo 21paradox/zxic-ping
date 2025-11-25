@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 daemonize = "0.5"
+libc = "0.2"
 

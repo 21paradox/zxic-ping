@@ -22,4 +22,5 @@ name = "zxic_ping"
 version = "0.1.0"
 dependencies = [
  "daemonize",
+ "libc",
 ]

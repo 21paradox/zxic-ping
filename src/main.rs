@@ -9,20 +9,25 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::UNIX_EPOCH;
 use std::net::SocketAddr;
 
+use libc::{self, c_int};
+use std::io;
+
 use daemonize::Daemonize;
 
 const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
 const DAY_INTERVAL: u64 = 86400; // 网络检查间隔60秒
-const CPU_CHECK_INTERVAL: u64 = 30; // CPU检查间隔30秒
+const SNAT_CHECK_INTERVAL: u64 = 300; // CPU检查间隔30秒
 // const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
 const MAX_FAILURES: u32 = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HIGH_LATENCY: u32 = 3;
-const HIGH_LATENCY_THRESHOLD: u128 = 50; // 50ms
+const HIGH_LATENCY_THRESHOLD: u128 = 300; // 50ms
+const HIGH_LATENCY_THRESHOLD_MIN: u128 = 100; // 50ms
+const HIGH_LATENCY_THRESHOLD_MAX: u128 = 2000; // 50ms
 
 // CPU占用率监控配置
-const CPU_USAGE_THRESHOLD: f32 = 85.0; // CPU占用率阈值 80%
+// const CPU_USAGE_THRESHOLD: f32 = 85.0; // CPU占用率阈值 80%
 // const HIGH_LOAD_CHECK_INTERVAL: u64 = 15; // 高负载时网络检查间隔（秒）
 // const NORMAL_CHECK_INTERVAL: u64 = 30; // 正常负载时网络检查间隔（秒）
 
@@ -38,35 +43,6 @@ const KILL_SIGNAL_ADBD: &[u8] = b"KILL_ADBD";
 const RESTART_SIGNAL_SERVER: &[u8] = b"RESTART_SERVER";
 const SIGNAL_PING: &[u8] = b"PING";
 
-
-#[derive(Debug, Clone)]
-struct CpuStats {
-    user: u64,
-    nice: u64,
-    system: u64,
-    idle: u64,
-    iowait: u64,
-    irq: u64,
-    softirq: u64,
-    steal: u64,
-    guest: u64,
-    guest_nice: u64,
-}
-
-impl CpuStats {
-    fn total(&self) -> u64 {
-        self.user + self.nice + self.system + self.idle + self.iowait +
-        self.irq + self.softirq + self.steal + self.guest + self.guest_nice
-    }
-    
-    fn idle_total(&self) -> u64 {
-        self.idle + self.iowait
-    }
-    
-    fn active_total(&self) -> u64 {
-        self.total() - self.idle_total()
-    }
-}
 
 #[repr(u8)]
 #[derive(Copy, Clone)]
@@ -109,10 +85,16 @@ fn main() {
         println!("Network monitor started for {}", target_ip);
         println!("Network check interval: {} seconds", PING_INTERVAL);
         println!("Reboot after {} consecutive failures", MAX_FAILURES);
-        println!("CPU usage threshold: {:.0}%", CPU_USAGE_THRESHOLD);
         println!("Usage: {} [TARGET_IP] [--background] [--isprod]", args[0]);
     }
     
+    let target_sock_ip = match target_ip.parse::<SocketAddr>() {
+        Ok(sock) => sock.ip().to_string(),
+        Err(_)   => {
+            log_message(&format!("invalid target_ip: {}", target_ip), is_prod);
+            return;
+        }
+    };
     log_message(&format!("Network monitor started for {}", target_ip), is_prod);
 
     // 创建共享标志用于强制重启
@@ -130,30 +112,25 @@ fn main() {
     signal_sock.set_nonblocking(true).expect("set_nonblocking");
     
     let mut failure_count = 0;
-    let mut high_load_count = 0;
-    let mut back_to_normal_load_count = 0;
     let mut high_latency_count = 0;
-    let mut last_cpu_check = Instant::now();
     let mut last_network_check = Instant::now();
+    let mut last_snat_check = Instant::now();
     // let mut last_udp_notification = Instant::now();
     // let mut last_adbd_check = Instant::now();
     let mut last_log_prune = Instant::now();
     
-    // 初始化CPU统计
-    let mut prev_cpu_stats = match get_cpu_stats() {
-        Ok(stats) => stats,
-        Err(e) => {
-            log_message(&format!("Failed to get initial CPU stats: {}", e), is_prod);
-            // 使用默认值继续运行
-            CpuStats {
-                user: 0, nice: 0, system: 0, idle: 0, iowait: 0,
-                irq: 0, softirq: 0, steal: 0, guest: 0, guest_nice: 0,
-            }
-        }
-    };
-
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
+    force_kill_process(is_prod, "dnsmasq");
+    force_kill_process(is_prod, "goahead");
+    match force_start_goahead_process(is_prod) {
+        Ok(_) => {
+            log_message("✅ gohead force restarted successfully", is_prod);
+        }
+        Err(e) => {
+            log_message(&format!("❌ Failed to force restart gohead: {}", e), is_prod);
+        }
+    }
     
     let mut buf = [0u8; 64];
     loop {
@@ -208,7 +185,7 @@ fn main() {
             }
             ServerCmd::KillADB => {
                 server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
-                match force_kill_adbd_process(is_prod) {
+                match force_kill_process(is_prod, "adbd") {
                     Ok(_) => {
                         log_message("✅ adbd force restarted successfully", is_prod);
                         send_udp_notification("ADBD_FORCE_KILLED", target_ip.clone(), is_prod);
@@ -225,61 +202,51 @@ fn main() {
             ServerCmd::None => {}
         }
         
-        // CPU占用率检查 - 每30秒一次
-        if now.duration_since(last_cpu_check) >= Duration::from_secs(CPU_CHECK_INTERVAL) {
-            match get_cpu_stats() {
-                Ok(current_cpu_stats) => {
-                    let usage = calculate_cpu_usage(&prev_cpu_stats, &current_cpu_stats);
-                    prev_cpu_stats = current_cpu_stats;
-                    
-                    if usage > CPU_USAGE_THRESHOLD {
-                        if high_load_count == 0 {
-                            log_message(&format!("High CPU usage detected: {:.1}%, entering high load mode", usage), is_prod);
-                            high_load_count += 1;
-                            // current_cpu_interval = HIGH_LOAD_CHECK_INTERVAL;
-                            // 在高负载模式下，可以添加额外的保护措施
-                            send_udp_notification(&format!("HIGH_LOAD_ENTER: CPU={:.1}%", usage), target_ip.clone(), is_prod);
+        if now.duration_since(last_snat_check) >= Duration::from_secs(SNAT_CHECK_INTERVAL) {
+            let br_network = get_br_network(is_prod);
+            let wan1_ip = get_wan_ip_address(is_prod);
+    
+            if !br_network.is_empty() && !wan1_ip.is_empty() {
+                // 检查当前第一条规则是否包含正确的 WAN IP
+                let check_cmd = "iptables -t nat -L POSTROUTING 1";
+                let needs_update = match Command::new("sh").arg("-c").arg(check_cmd).output() {
+                    Ok(output) => {
+                        if output.status.success() {
+                            let current_rule = String::from_utf8_lossy(&output.stdout);
+                            // 检查规则是否包含正确的 WAN IP
+                            let expected_pattern = format!("SNAT --to-source {}", wan1_ip);
+                            !current_rule.contains(&expected_pattern)
                         } else {
-                            log_message(&format!("High load mode active - CPU usage: {:.1}%", usage), is_prod);
-                            high_load_count += 1;
-                            send_udp_notification(&format!("HIGH_LOAD: CPU={:.1}%", usage), target_ip.clone(), is_prod);
-                            if high_load_count == 3 {
-                                throttle_network_parameters(is_prod);
-                            }
-                        }
-                        back_to_normal_load_count = 0;
-                        // last_udp_notification = now;
-                        
-                    } else {
-                        if high_load_count > 0 {
-                            log_message(&format!("CPU usage normalized: {:.1}%, returning to normal mode", usage), is_prod);
-
-                            // current_cpu_interval = NORMAL_CHECK_INTERVAL;
-                            back_to_normal_load_count += 1;
-                            let mut restoreflag = false;
-
-                            if back_to_normal_load_count >= 3 {
-                                restoreflag = true;
-                                high_load_count = 0;
-                                back_to_normal_load_count = 0;
-                            }
-                            // 退出高负载模式时发送通知
-                            send_udp_notification(&format!("HIGH_LOAD_EXIT: CPU={:.1}%", usage), target_ip.clone(), is_prod);
-
-                            if restoreflag {
-                                restore_network_parameters(is_prod);
-                                clear_page_cache(is_prod);
-                            }
-                        } else {
-                            //log_message(&format!("CPU usage normal: {:.1}%", usage), is_prod);
+                            // 如果获取规则失败，假定需要更新
+                            true
                         }
                     }
-                }
-                Err(e) => {
-                    log_message(&format!("Failed to check CPU usage: {}", e), is_prod);
-                }
+                    Err(_) => {
+                        // 如果执行命令失败，假定需要更新
+                        true
+                    }
+                };
+
+                if needs_update {
+                    let ipt_cmds = [
+                        format!("iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j SNAT --to-source {}", target_sock_ip, wan1_ip),
+                        "iptables -t nat -D POSTROUTING 2".to_string(),
+                    ];
+            
+                    for cmd in &ipt_cmds {
+                        if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
+                            if !is_prod {
+                                log_message(&format!("Failed to adjust network parameter {}: {}", cmd, e), is_prod);
+                            }
+                        }
+                    }
+            
+                    if !is_prod {
+                        log_message(&format!("SNAT rule updated with new WAN IP: {}", wan1_ip), is_prod);
+                    }
+                } 
             }
-            last_cpu_check = now;
+            last_snat_check = now;
         }
         
         // 网络连通性检查 - 根据负载模式调整间隔
@@ -290,17 +257,32 @@ fn main() {
                         high_latency_count += 1;
                         log_message(&format!("High latency detected: {}ms (> {}ms)", connect_duration.as_millis(), HIGH_LATENCY_THRESHOLD), is_prod);
                         log_message(&format!("High latency count: {}/{}", high_latency_count, MAX_HIGH_LATENCY), is_prod);
+
+                        send_udp_notification(&format!("HIGH_LATENCY: LATENCY={:.1}", connect_duration.as_millis()), target_ip.clone(), is_prod);
+                        if connect_duration.as_millis() > HIGH_LATENCY_THRESHOLD_MAX && high_latency_count < MAX_HIGH_LATENCY {
+                            high_latency_count = MAX_HIGH_LATENCY
+                        }
                 
                         if high_latency_count == MAX_HIGH_LATENCY {
                             log_message(&format!("WARN: {} consecutive high latency connections detected", MAX_HIGH_LATENCY), is_prod);
+                            force_kill_process(is_prod, "adbd");
+                            force_kill_process(is_prod, "goahead");
                             throttle_network_parameters(is_prod);
                         }
                     } else {
-                        // 延迟正常时重置计数器
-                        if high_latency_count == 3 {
-                          restore_network_parameters(is_prod);
+                        if high_latency_count >= MAX_HIGH_LATENCY {
+                            if connect_duration.as_millis() < HIGH_LATENCY_THRESHOLD_MIN  {
+                                restore_network_parameters(is_prod);
+                                force_start_goahead_process(is_prod);
+                                clear_page_cache(is_prod);
+                                high_latency_count = 1
+                            } else {
+                                high_latency_count = MAX_HIGH_LATENCY
+                            }
+                        } else {
+                            high_latency_count = high_latency_count.saturating_sub(1);
                         }
-                        high_latency_count = 0;
+                        send_udp_notification(&format!("NORMAL_LATENCY: LATENCY={:.1}", connect_duration.as_millis()), target_ip.clone(), is_prod);
                     }
                     failure_count = 0;
                 }
@@ -356,64 +338,44 @@ fn main() {
     }
 }
 
-fn get_cpu_stats() -> Result<CpuStats, String> {
-    let stat_content = fs::read_to_string("/proc/stat")
-        .map_err(|e| format!("Failed to read /proc/stat: {}", e))?;
-    
-    // 查找第一行（总CPU统计）
-    for line in stat_content.lines() {
-        if line.starts_with("cpu ") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 10 {
-                return Ok(CpuStats {
-                    user: parts[1].parse().unwrap_or(0),
-                    nice: parts[2].parse().unwrap_or(0),
-                    system: parts[3].parse().unwrap_or(0),
-                    idle: parts[4].parse().unwrap_or(0),
-                    iowait: parts[5].parse().unwrap_or(0),
-                    irq: parts[6].parse().unwrap_or(0),
-                    softirq: parts[7].parse().unwrap_or(0),
-                    steal: parts[8].parse().unwrap_or(0),
-                    guest: parts[9].parse().unwrap_or(0),
-                    guest_nice: parts.get(10).and_then(|s| s.parse().ok()).unwrap_or(0),
-                });
+pub struct ProcessPriority;
+impl ProcessPriority {
+    /// 设置进程的 nice 值
+    /// priority: -20 (最高) 到 19 (最低)
+    pub fn set_nice(pid: u32, priority: i32) -> Result<(), String> {
+        unsafe {
+            // 0 表示当前进程，>0 表示具体 PID
+            let who: libc::c_uint = pid;
+            let ret = libc::setpriority(libc::PRIO_PROCESS as libc::c_int, who, priority);
+            if ret == -1 {
+                let err = io::Error::last_os_error();
+                return Err(format!(
+                    "setpriority({}) for PID {} failed: {}",
+                    priority, pid, err
+                ));
             }
+            Ok(())
         }
     }
     
-    Err("Cannot find CPU statistics in /proc/stat".to_string())
-}
-
-fn calculate_cpu_usage(prev: &CpuStats, current: &CpuStats) -> f32 {
-    let prev_active = prev.active_total();
-    let prev_total = prev.total();
-    
-    let current_active = current.active_total();
-    let current_total = current.total();
-    
-    // 计算增量
-    let active_delta = current_active as i64 - prev_active as i64;
-    let total_delta = current_total as i64 - prev_total as i64;
-    
-    if total_delta > 0 {
-        (active_delta as f32 / total_delta as f32) * 100.0
-    } else {
-        0.0
+    /// 设置当前进程的 nice 值
+    pub fn set_current_nice(priority: i32) -> Result<(), String> {
+        Self::set_nice(0, priority)
     }
 }
 
 fn throttle_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
     let commands = [
-        "echo 800 > /proc/sys/net/core/netdev_max_backlog",
+        // "echo 800 > /proc/sys/net/core/netdev_max_backlog",
+        "echo 3800 > /proc/sys/net/nf_conntrack_max",
         "echo 3000 > /proc/sys/net/unix/max_dgram_qlen",
-        //"echo 100 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
+        // "echo 150 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
 
         "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
         "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
         "echo 5 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
         "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
-        "echo 3800 > /proc/sys/net/nf_conntrack_max",
     ];
     for cmd in commands.iter() {
         if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
@@ -428,7 +390,7 @@ fn restore_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
 
     let commands = [
-        "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
+        // "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
         "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
         "echo 10 > /proc/sys/net/ipv4/tcp_retries2",
         "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
@@ -448,34 +410,34 @@ fn restore_network_parameters(is_prod: bool) {
         }
     }
 }
-// fn get_br_ip_address(is_prod: bool) -> String {
-//     // 方法1: 使用 ip 命令获取 wan1 接口的 IP
-//     if let Ok(output) = Command::new("ip")
-//         .args(["addr", "show", "br0"])
-//         .output() 
-//     {
-//         if output.status.success() {
-//             let output_str = String::from_utf8_lossy(&output.stdout);
-//             for line in output_str.lines() {
-//                 if line.trim().starts_with("inet ") {
-//                     let parts: Vec<&str> = line.trim().split_whitespace().collect();
-//                     if parts.len() >= 2 {
-//                         let ip_with_mask = parts[1];
-//                         if let Some(ip) = ip_with_mask.split('/').next() {
-//                             if !ip.is_empty() && ip != "127.0.0.1" {
-//                                 log_message(&format!("Found wan1 IP via ip command: {}", ip), is_prod);
-//                                 return ip.to_string();
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//     }
+fn get_wan_ip_address(is_prod: bool) -> String {
+    // 方法1: 使用 ip 命令获取 wan1 接口的 IP
+    if let Ok(output) = Command::new("ip")
+        .args(["addr", "show", "wan1"])
+        .output() 
+    {
+        if output.status.success() {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            for line in output_str.lines() {
+                if line.trim().starts_with("inet ") {
+                    let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let ip_with_mask = parts[1];
+                        if let Some(ip) = ip_with_mask.split('/').next() {
+                            if !ip.is_empty() && ip != "127.0.0.1" {
+                                log_message(&format!("Found wan1 IP via ip command: {}", ip), is_prod);
+                                return ip.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-//     log_message("Could not determine wan1 IP address", is_prod);
-//     String::new()
-// }
+    log_message("Could not determine wan1 IP address", is_prod);
+    String::new()
+}
 
 fn get_br_network(is_prod: bool) -> String {
     // 获取 br0 接口的网络地址 (如 192.168.0.0/24)
@@ -514,6 +476,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
         }
     };
     let br_network = get_br_network(is_prod);
+    let wan1_ip = get_wan_ip_address(is_prod);
 
     let commands = [
         "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
@@ -534,7 +497,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
         //"echo 0 > /proc/sys/net/ipv4/tcp_window_scaling"
     ];
 
-    if !br_network.is_empty() {
+    if !br_network.is_empty() && !wan1_ip.is_empty() {
         let ipt_cmds = [
             "iptables -P INPUT ACCEPT".to_string(),
             "iptables -P FORWARD ACCEPT".to_string(),
@@ -542,10 +505,10 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
             "iptables -F -t filter".to_string(),
             "iptables -F -t nat".to_string(),
             // "iptables -t nat -A POSTROUTING -s 192.168.8.2/32 -o wan1 -j MASQUERADE",
-            format!("iptables -t nat -A POSTROUTING -s {}/32 -o wan1 -j MASQUERADE", ip_only),
+            // format!("iptables -t nat -A POSTROUTING -s {}/32 -o wan1 -j MASQUERADE", ip_only),
+            format!("iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j SNAT --to-source {}", ip_only, wan1_ip),
             //&format!("iptables -t nat -A POSTROUTING -s {} -o wan1 -j MASQUERADE", br_network),
             "ip6tables -F".to_string(),
-             //&format!("iptables -t nat -I POSTROUTING -s 192.168.0.2/32 -o wan1 -j SNAT --to-source {}", wan1_ip)
         ];
         for cmd in &ipt_cmds {
             if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
@@ -582,8 +545,8 @@ fn daemonize_simple() {
     let dev_null = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/null")
-        // .open("/etc_rw/zxping.log")
+        // .open("/dev/null")
+        .open("/etc_rw/zxping.log")
         .expect("cannot open /dev/null");
 
     Daemonize::new()
@@ -800,6 +763,32 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
     }
 }
 
+pub fn force_start_goahead_process(is_prod: bool) -> Result<(), String> {
+        log_message("Force restart goahead process...", is_prod);
+        
+        // 启动进程
+        let mut child = Command::new("/bin/goahead")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start goahead: {}", e))?;
+        
+        // 设置子进程优先级
+        let pid = child.id();
+
+        log_message(&format!("set goahead pid={} pri", pid), is_prod);
+        if let Err(e) = ProcessPriority::set_nice(pid, 15) {
+            log_message(&format!("Warning: Could not set priority for goahead: {}", e), is_prod);
+        } else {
+            log_message(&format!("Set goahead (PID: {}) priority to nice={}", pid, 15), is_prod);
+        }
+        // 分离子进程，让它在后台运行
+        // 如果你不需要等待进程结束，可以注释掉下面的 wait
+        // let _ = child.wait(); // 不关心退出状态
+        log_message("goahead force restarted successfully", is_prod);
+        Ok(())
+}
+
 // 同时修复 check_and_start_adbd 函数中的相同问题
 // fn check_and_start_adbd(is_prod: bool) -> Result<bool, String> {
 //     let mut adbd_found = false;
@@ -885,8 +874,8 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
 
 
 // 强制重启adbd进程
-fn force_kill_adbd_process(is_prod: bool) -> Result<(), String> {
-    log_message("Force restarting adbd process...", is_prod);
+fn force_kill_process(is_prod: bool, process_name: &str) -> Result<(), String> {
+    log_message("Force restarting process...", is_prod);
     
      // 1. 查找并杀死所有adbd进程
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -897,7 +886,7 @@ fn force_kill_adbd_process(is_prod: bool) -> Result<(), String> {
             if name_str.chars().all(|c| c.is_ascii_digit()) {
                 let cmdline_path = format!("/proc/{}/cmdline", name_str);
                 if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
-                    if cmdline_content.contains("adbd") {
+                    if cmdline_content.contains(process_name) {
                         // 修复：将 Cow<'_, str> 转换为 String
                         let pid = name_str.to_string();
                         // 杀死adbd进程
