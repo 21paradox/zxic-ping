@@ -71,12 +71,12 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     
     // 检查是否需要后台运行
-    if args.iter().any(|arg| arg == "--background" || arg == "-b") {
-        daemonize_simple();
-    }
     let mut is_prod = false;
     if args.iter().any(|arg| arg == "--isprod") {
        is_prod = true;
+    }
+    if args.iter().any(|arg| arg == "--background" || arg == "-b") {
+        daemonize_simple(is_prod);
     }
     
     let target_ip = get_target_ip();
@@ -214,7 +214,7 @@ fn main() {
                         if output.status.success() {
                             let current_rule = String::from_utf8_lossy(&output.stdout);
                             // 检查规则是否包含正确的 WAN IP
-                            let expected_pattern = format!("SNAT --to-source {}", wan1_ip);
+                            let expected_pattern = format!("to:{}", wan1_ip);
                             !current_rule.contains(&expected_pattern)
                         } else {
                             // 如果获取规则失败，假定需要更新
@@ -541,13 +541,16 @@ fn clear_page_cache(is_prod: bool) {
     }
 }
 
-fn daemonize_simple() {
+fn daemonize_simple(is_prod: bool) {
+    let stdout = if is_prod { "/dev/null" } else { "/etc_rw/zxping.log" };
+
     let dev_null = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .open(stdout)
         // .open("/dev/null")
-        .open("/etc_rw/zxping.log")
-        .expect("cannot open /dev/null");
+        // .open("/etc_rw/zxping.log")
+        .expect(&format!("cannot open {}", stdout));
 
     Daemonize::new()
         .stdout(dev_null.try_clone().unwrap())
