@@ -19,7 +19,8 @@ const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
 const DAY_INTERVAL: u64 = 86400; // 网络检查间隔60秒
 const SNAT_CHECK_INTERVAL: u64 = 300; // CPU检查间隔30秒
 // const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
-const MAX_FAILURES: u32 = 10;
+const WARN_FAILURES: u32 = 10;
+const MAX_FAILURES: u32 = 15;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HIGH_LATENCY: u32 = 3;
 const HIGH_LATENCY_THRESHOLD: u128 = 300; // 50ms
@@ -296,8 +297,11 @@ fn main() {
                     log_message(&format!("✗ Connection to {} failed", target_ip), is_prod);
                     failure_count += 1;
                     log_message(&format!("Failure count: {}/{}", failure_count, MAX_FAILURES), is_prod);
-                    
-                    if failure_count >= MAX_FAILURES {
+                    if failure_count == WARN_FAILURES {
+                        log_message(&format!("Critical: {} consecutive pre failure detected", WARN_FAILURES), is_prod);
+                        log_message("try reset android usb...", is_prod);
+                        reset_android_usb(is_prod);
+                    } else if failure_count == MAX_FAILURES {
                         log_message(&format!("Critical: {} consecutive failures detected", MAX_FAILURES), is_prod);
                         log_message("Initiating system reboot...", is_prod);
                         reboot_system(is_prod);
@@ -361,6 +365,21 @@ impl ProcessPriority {
     /// 设置当前进程的 nice 值
     pub fn set_current_nice(priority: i32) -> Result<(), String> {
         Self::set_nice(0, priority)
+    }
+}
+
+fn reset_android_usb(is_prod: bool) {
+    let commands = [
+        "echo 0 > /sys/class/android_usb/android0/enable",
+        "echo 1 > /sys/class/android_usb/android0/enable",
+    ];
+    for cmd in commands.iter() {
+        if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
+            if !is_prod {
+                log_message(&format!("Failed to adjust network parameter {}: {}", cmd, e), is_prod);
+            }
+        }
+        thread::sleep(Duration::from_millis(3000));
     }
 }
 
@@ -493,6 +512,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout_stream",
         "echo 20 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_close",
         "echo 4800 > /proc/sys/net/nf_conntrack_max",
+        "echo 480 > /proc/sys/net/netfilter/nf_conntrack_expect_max"
 
         //"echo 0 > /proc/sys/net/ipv4/tcp_window_scaling"
     ];
@@ -598,7 +618,8 @@ fn tcp_connect_check(target_ip: &str, is_prod: bool) -> bool {
         &target_ip.parse().unwrap(),
         CONNECT_TIMEOUT
     ) {
-        Ok(_) => {
+        Ok(stream) => {
+            drop(stream);
             let duration = start.elapsed();
             if !is_prod {
                 log_message(&format!("TCP connect successful, took {:?}", duration), is_prod);
@@ -637,7 +658,7 @@ fn send_udp_notification(message: &str, addr: String, is_prod: bool) {
             match socket.send_to(full_message.as_bytes(), addr) {
                 Ok(_) => {
                     if !is_prod {
-                        log_message(&format!("UDP notification sent: {}", full_message), is_prod);
+                        // log_message(&format!("UDP notification sent: {}", full_message), is_prod);
                     }
                 }
                 Err(e) => {
