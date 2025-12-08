@@ -158,7 +158,7 @@ fn main() {
                     // 发送确认响应
                     let _ = signal_sock.send_to(b"OK", src);
                 } else if received == SIGNAL_PING {
-                    log_message(&format!("📨 Received ping signal from {}", src), is_prod);                            
+                    // log_message(&format!("📨 Received ping signal from {}", src), is_prod);                            
                     let _ = signal_sock.send_to(b"OK", src);
                 }
                 // 清空缓冲区
@@ -328,14 +328,14 @@ fn main() {
         //     last_adbd_check = now;
         // }
 
-        if now.duration_since(last_log_prune) >= Duration::from_secs(DAY_INTERVAL) {
-            if let Err(e) = fs::write("/etc_rw/zxping.log", "") {
-                log_message(&format!("Failed to clear zxping.log: {}", e), is_prod);
-            } else {
-                log_message("zxping.log cleared", is_prod);
-            }
-            last_log_prune = now;
-        }
+        // if now.duration_since(last_log_prune) >= Duration::from_secs(DAY_INTERVAL) {
+        //     if let Err(e) = fs::write("/etc_rw/zxping.log", "") {
+        //         log_message(&format!("Failed to clear zxping.log: {}", e), is_prod);
+        //     } else {
+        //         log_message("zxping.log cleared", is_prod);
+        //     }
+        //     last_log_prune = now;
+        // }
 
         // 睡眠1秒后继续检查，避免忙等待
         thread::sleep(Duration::from_secs(2));
@@ -386,15 +386,15 @@ fn reset_android_usb(is_prod: bool) {
 fn throttle_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
     let commands = [
-        // "echo 800 > /proc/sys/net/core/netdev_max_backlog",
-        "echo 3800 > /proc/sys/net/nf_conntrack_max",
+        "echo 800 > /proc/sys/net/core/netdev_max_backlog",
         "echo 3000 > /proc/sys/net/unix/max_dgram_qlen",
+        "echo 3500 > /proc/sys/net/nf_conntrack_max",
         // "echo 150 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
 
-        "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
-        "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
-        "echo 5 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
-        "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
+        // "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
+        // "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
+        // "echo 5 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
+        // "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
     ];
     for cmd in commands.iter() {
         if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
@@ -409,13 +409,13 @@ fn restore_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
 
     let commands = [
-        // "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
+        "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
         "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
-        "echo 10 > /proc/sys/net/ipv4/tcp_retries2",
-        "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
-        "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
-        "echo 1800 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
-        "echo 4800 > /proc/sys/net/nf_conntrack_max",
+        // "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
+        // "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
+        // "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
+        // "echo 1800 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
+        "echo 4500 > /proc/sys/net/nf_conntrack_max",
     ];
 
 
@@ -444,7 +444,7 @@ fn get_wan_ip_address(is_prod: bool) -> String {
                         let ip_with_mask = parts[1];
                         if let Some(ip) = ip_with_mask.split('/').next() {
                             if !ip.is_empty() && ip != "127.0.0.1" {
-                                log_message(&format!("Found wan1 IP via ip command: {}", ip), is_prod);
+                                // log_message(&format!("Found wan1 IP via ip command: {}", ip), is_prod);
                                 return ip.to_string();
                             }
                         }
@@ -472,7 +472,7 @@ fn get_br_network(is_prod: bool) -> String {
                 if parts.len() >= 1 && parts[0].contains('/') {
                     let network = parts[0];
                     if network != "default" && !network.starts_with("169.254") {
-                        log_message(&format!("Found br0 network: {}", network), is_prod);
+                        // log_message(&format!("Found br0 network: {}", network), is_prod);
                         return network.to_string();
                     }
                 }
@@ -502,17 +502,17 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
         "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
         "echo 128 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
 
-        "echo 10 > /proc/sys/net/ipv4/tcp_retries2",
+        "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
         "echo 15 > /proc/sys/net/ipv4/tcp_fin_timeout",
-        "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
+        "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
-        "echo 1800 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
+        "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
 
         "echo 15 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout",
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout_stream",
         "echo 20 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_close",
-        "echo 4800 > /proc/sys/net/nf_conntrack_max",
-        "echo 480 > /proc/sys/net/netfilter/nf_conntrack_expect_max"
+        "echo 4500 > /proc/sys/net/nf_conntrack_max",
+        "echo 450 > /proc/sys/net/netfilter/nf_conntrack_expect_max"
 
         //"echo 0 > /proc/sys/net/ipv4/tcp_window_scaling"
     ];
@@ -622,7 +622,7 @@ fn tcp_connect_check(target_ip: &str, is_prod: bool) -> bool {
             drop(stream);
             let duration = start.elapsed();
             if !is_prod {
-                log_message(&format!("TCP connect successful, took {:?}", duration), is_prod);
+                // log_message(&format!("TCP connect successful, took {:?}", duration.as_millis()), is_prod);
             }
             true
         }
@@ -918,7 +918,7 @@ fn force_kill_process(is_prod: bool, process_name: &str) -> Result<(), String> {
                             .arg("-9")
                             .arg(&pid)
                             .status();
-                        log_message(&format!("Killed adbd process (PID: {})", pid), is_prod);
+                        log_message(&format!("force Killed process (PID: {})", pid), is_prod);
                     }
                 }
             }

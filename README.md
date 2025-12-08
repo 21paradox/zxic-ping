@@ -22,3 +22,13 @@ adb push ./target/armv7-unknown-linux-musleabi/release/zxic_ping /etc_rw/zxic_pi
 ### 相关项目
 - https://github.com/anysoft/zxic-web-tty
 - https://github.com/Amamiyashi0n/alice-pusher-bot-zxic.git
+
+
+
+### 调优命令
+
+```sh
+nv set usb_devices_debug=adb
+nv set select_type=select_cdc
+
+```
