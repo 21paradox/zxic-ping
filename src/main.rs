@@ -133,9 +133,9 @@ fn main() {
         }
     }
     
-    let mut buf = [0u8; 64];
     loop {
         let now = Instant::now();
+        let mut buf = [0u8; 64];
         match signal_sock.recv_from(&mut buf) {
             Ok((size, src)) => {
                 let received = &buf[..size];
@@ -161,8 +161,6 @@ fn main() {
                     // log_message(&format!("📨 Received ping signal from {}", src), is_prod);                            
                     let _ = signal_sock.send_to(b"OK", src);
                 }
-                // 清空缓冲区
-                buf.fill(0);
             }
             Err(e) => {
                 // if !is_prod {
@@ -386,8 +384,8 @@ fn reset_android_usb(is_prod: bool) {
 fn throttle_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
     let commands = [
-        "echo 800 > /proc/sys/net/core/netdev_max_backlog",
-        "echo 3000 > /proc/sys/net/unix/max_dgram_qlen",
+        // "echo 800 > /proc/sys/net/core/netdev_max_backlog",
+        // "echo 3000 > /proc/sys/net/unix/max_dgram_qlen",
         "echo 3500 > /proc/sys/net/nf_conntrack_max",
         // "echo 150 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
 
@@ -409,8 +407,8 @@ fn restore_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
 
     let commands = [
-        "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
-        "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
+        // "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
+        // "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
         // "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
         // "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
         // "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
@@ -498,6 +496,9 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
     let wan1_ip = get_wan_ip_address(is_prod);
 
     let commands = [
+        "echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+        "echo 2200 > /sys/module/net_ext_modul/parameters/skb_num_limit",
+        "echo 1400 > /sys/module/net_ext_modul/parameters/skb_max_panic",
         "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
         "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
         "echo 128 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
@@ -567,8 +568,8 @@ fn daemonize_simple(is_prod: bool) {
     let dev_null = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(stdout)
-        // .open("/dev/null")
+        // .open(stdout)
+        .open("/dev/null")
         // .open("/etc_rw/zxping.log")
         .expect(&format!("cannot open {}", stdout));
 
