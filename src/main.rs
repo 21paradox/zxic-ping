@@ -123,15 +123,15 @@ fn main() {
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
     force_kill_process(is_prod, "dnsmasq");
-    force_kill_process(is_prod, "goahead");
-    match force_start_goahead_process(is_prod) {
-        Ok(_) => {
-            log_message("✅ gohead force restarted successfully", is_prod);
-        }
-        Err(e) => {
-            log_message(&format!("❌ Failed to force restart gohead: {}", e), is_prod);
-        }
-    }
+    // force_kill_process(is_prod, "goahead");
+    // match force_start_goahead_process(is_prod) {
+    //     Ok(_) => {
+    //         log_message("✅ gohead force restarted successfully", is_prod);
+    //     }
+    //     Err(e) => {
+    //         log_message(&format!("❌ Failed to force restart gohead: {}", e), is_prod);
+    //     }
+    // }
     
     loop {
         let now = Instant::now();
@@ -413,10 +413,8 @@ fn restore_network_parameters(is_prod: bool) {
         // "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
         // "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
         // "echo 1800 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
-        "echo 4500 > /proc/sys/net/nf_conntrack_max",
+        "echo 4096 > /proc/sys/net/nf_conntrack_max",
     ];
-
-
 
     for cmd in commands.iter() {
         thread::sleep(Duration::from_millis(200));
@@ -506,15 +504,39 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
         "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
         "echo 15 > /proc/sys/net/ipv4/tcp_fin_timeout",
         "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
+
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
-        "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
-
-        "echo 15 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout",
-        "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout_stream",
+        "echo 300 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
+        "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_syn_sent2",
         "echo 20 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_close",
-        "echo 4500 > /proc/sys/net/nf_conntrack_max",
-        "echo 450 > /proc/sys/net/netfilter/nf_conntrack_expect_max"
 
+        "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout",
+        "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout_stream",
+        "echo 4096 > /proc/sys/net/nf_conntrack_max",
+        "echo 450 > /proc/sys/net/netfilter/nf_conntrack_expect_max",
+        
+        // "echo 0 > /proc/sys/net/netfilter/nf_conntrack_log_invalid",
+        // "echo 0 > /proc/sys/net/netfilter/nf_conntrack_checksum",
+        "echo 1 > /proc/sys/net/netfilter/nf_conntrack_tcp_loose",
+
+        "echo 600 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established",
+        "echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent",
+        "echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent2",
+        "echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_recv",
+
+        "echo 30 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait",
+        "echo 30 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_last_ack",
+        "echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close",
+        "echo 30 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close_wait",
+
+        "echo 30 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait",
+        "echo 3 > /proc/sys/net/netfilter/nf_conntrack_tcp_max_retrans",
+        "echo 30 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_max_retrans",
+        "echo 10 > /proc/sys/net/netfilter/nf_conntrack_udp_timeout",
+        "echo 60 > /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+        "echo 10 > /proc/sys/net/netfilter/nf_conntrack_icmp_timeout",
+
+        "echo 100 > /proc/sys/net/netfilter/nf_conntrack_generic_timeout",
         //"echo 0 > /proc/sys/net/ipv4/tcp_window_scaling"
     ];
 
@@ -530,6 +552,8 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
             format!("iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j SNAT --to-source {}", ip_only, wan1_ip),
             //&format!("iptables -t nat -A POSTROUTING -s {} -o wan1 -j MASQUERADE", br_network),
             "ip6tables -F".to_string(),
+            "ifconfig wan1 txqueuelen 100".to_string(),
+            "ifconfig br0 txqueuelen 500".to_string(),
         ];
         for cmd in &ipt_cmds {
             if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
