@@ -20,6 +20,8 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           nix_path: nixpkgs=${{ env.NIXPKGS_PIN }}
 
+      - name: Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v6
       # 3. 提前 vendor（如果仓库里没 vendor 目录）
       # - name: Vendor dependencies
       #   run: |
