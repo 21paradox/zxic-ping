@@ -2,15 +2,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use std::env;
 use std::process::{Command, Stdio};
-use std::fs;
+use std::fs::{self, File};
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 use std::net::SocketAddr;
+use std::io::{self, BufRead, BufReader};
+use std::os::unix::io::AsRawFd;
 
 use libc::{self, c_int};
-use std::io;
 
 use daemonize::Daemonize;
 
@@ -18,6 +19,9 @@ const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
 const DAY_INTERVAL: u64 = 86400; // 网络检查间隔60秒
 const SNAT_CHECK_INTERVAL: u64 = 300; // CPU检查间隔30秒
+const USB_HEALTH_CHECK_INTERVAL: u64 = 10; // USB健康检查间隔10秒
+const USB_WARNING_THRESHOLD: u32 = 3; // USB警告阈值
+const USB_CRITICAL_THRESHOLD: u32 = 2; // USB危险阈值
 // const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
 const WARN_FAILURES: u32 = 10;
 const MAX_FAILURES: u32 = 15;
@@ -41,8 +45,33 @@ const UDP_TIMEOUT: Duration = Duration::from_secs(2); // UDP发送超时时间
 const SIGNAL_LISTEN_PORT: u16 = 1300; // 信号监听端口
 const RESTART_SIGNAL_ADBD: &[u8] = b"RESTART_ADBD";
 const KILL_SIGNAL_ADBD: &[u8] = b"KILL_ADBD"; 
+const DISABLE_ADB: &[u8] = b"DISABLE_ADB";
 const RESTART_SIGNAL_SERVER: &[u8] = b"RESTART_SERVER";
+const RESTART_SIGNAL_GOAHEAD: &[u8] = b"RESTART_GOAHEAD";
+const REDUCE_KERNEL_LOAD: &[u8] = b"REDUCE_KERNEL_LOAD";
 const SIGNAL_PING: &[u8] = b"PING";
+const ENABLE_KMSG_MONITOR: &[u8] = b"ENABLE_KMSG_MONITOR";
+const DISABLE_KMSG_MONITOR: &[u8] = b"DISABLE_KMSG_MONITOR";
+
+// KMSG 监控配置
+const KMSG_CHECK_INTERVAL: Duration = Duration::from_millis(1000); // KMSG检查间隔100ms
+const KMSG_PANIC_KEYWORDS: &[&str] = &[
+    "error",
+    "overflow",
+    "panic",
+    "hung",
+    "fault",
+    "unable",
+    "memory",
+    "Call Trace",
+    "overflow",
+    "corrupted",
+    "warn",
+    "lock",
+    "blocked",
+];
+
+// echo -n "REDUCE_KERNEL_LOAD" | nc -u <TARGETIP> 1300
 
 
 #[repr(u8)]
@@ -52,6 +81,11 @@ enum ServerCmd {
     RestartADB   = 1,
     KillADB      = 2,
     RestartSERVER   = 3,
+    DisableADB   = 4,
+    RestartGoAhead = 5,
+    ReduceKernelLoad = 6,
+    EnableKmsgMonitor = 7,
+    DisableKmsgMonitor = 8,
 }
 
 impl ServerCmd {
@@ -63,8 +97,126 @@ impl ServerCmd {
             1 => ServerCmd::RestartADB,
             2 => ServerCmd::KillADB,
             3 => ServerCmd::RestartSERVER,
+            4 => ServerCmd::DisableADB,
+            5 => ServerCmd::RestartGoAhead,
+            6 => ServerCmd::ReduceKernelLoad,
+            7 => ServerCmd::EnableKmsgMonitor,
+            8 => ServerCmd::DisableKmsgMonitor,
             _ => ServerCmd::None,
         }
+    }
+}
+
+/// KMSG 监控状态 - 极简内存设计，无线程
+struct KmsgMonitor {
+    enabled: AtomicBool,
+    reader: Option<BufReader<File>>,
+    last_warning_time: Option<Instant>,
+}
+
+impl KmsgMonitor {
+    fn new() -> Self {
+        KmsgMonitor {
+            enabled: AtomicBool::new(false),
+            reader: None,
+            last_warning_time: None,
+        }
+    }
+
+    fn enable(&mut self, is_prod: bool) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            // 尝试打开 /proc/kmsg
+            match File::open("/proc/kmsg") {
+                Ok(file) => {
+                    // 设置为非阻塞模式
+                    unsafe {
+                        let fd = file.as_raw_fd();
+                        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                        if flags >= 0 {
+                            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        }
+                    }
+                    self.reader = Some(BufReader::new(file));
+                    self.enabled.store(true, Ordering::Relaxed);
+                    log_message("KMSG monitor enabled", is_prod);
+                }
+                Err(e) => {
+                    log_message(&format!("Failed to open /proc/kmsg: {}", e), is_prod);
+                }
+            }
+        }
+    }
+
+    fn disable(&mut self, is_prod: bool) {
+        if self.enabled.load(Ordering::Relaxed) {
+            self.enabled.store(false, Ordering::Relaxed);
+            self.reader = None;
+            log_message("KMSG monitor disabled", is_prod);
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// 在主循环中调用，检查 KMSG
+    fn check(&mut self, target_ip: &str, is_prod: bool) {
+        if !self.is_enabled() {
+            return;
+        }
+
+        const WARNING_COOLDOWN: Duration = Duration::from_secs(5);
+        let reader = match &mut self.reader {
+            Some(r) => r,
+            None => return,
+        };
+
+        // 尽可能多地读取行（非阻塞）
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // 没有更多数据
+                Ok(_) => {
+                    // 检查是否包含崩溃关键词
+                    if let Some(keyword) = Self::check_panic_keywords(&line) {
+                        let now = Instant::now();
+                        let should_warn = match self.last_warning_time {
+                            Some(t) if now.duration_since(t) >= WARNING_COOLDOWN => true,
+                            None => true,
+                            _ => false,
+                        };
+
+                        if should_warn {
+                            let warning_msg = format!(
+                                "KERNEL_WARNING: detected '{}' in kmsg: {}",
+                                keyword,
+                                line.trim().chars().take(200).collect::<String>()
+                            );
+                            log_message(&warning_msg, is_prod);
+                            send_udp_notification(&warning_msg, target_ip.to_string(), is_prod);
+                            self.last_warning_time = Some(now);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        break; // 没有更多数据可读
+                    }
+                    // 其他错误，记录但不影响主循环
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 检查行中是否包含崩溃关键词
+    fn check_panic_keywords(line: &str) -> Option<&str> {
+        for keyword in KMSG_PANIC_KEYWORDS {
+            if line.contains(keyword) {
+                return Some(keyword);
+            }
+        }
+        None
     }
 }
 
@@ -101,13 +253,12 @@ fn main() {
     // 创建共享标志用于强制重启
     let server_cmd = Arc::new(AtomicU8::new(ServerCmd::None as u8));
     
-    // 启动信号监听线程
+    // 创建 KMSG 监控器（极简设计，无线程）
+    let mut kmsg_monitor = KmsgMonitor::new();
+    
+    // 启动信号监听
     let server_cmd_clone = Arc::clone(&server_cmd);
 
-    // let is_prod_signal = is_prod;
-    // thread::spawn(move || {
-    //     listen_for_signal(server_cmd_clone, is_prod_signal);
-    // });
     let signal_sock = UdpSocket::bind(("0.0.0.0", SIGNAL_LISTEN_PORT))
                       .expect("bind signal port");
     signal_sock.set_nonblocking(true).expect("set_nonblocking");
@@ -151,10 +302,40 @@ fn main() {
                             
                     // 发送确认响应
                     let _ = signal_sock.send_to(b"OK", src);
+                } else if received == DISABLE_ADB {
+                    log_message(&format!("📨 Received disable adb signal from {}", src), is_prod);
+                    ServerCmd::DisableADB.store(&server_cmd_clone);
+                            
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
                 } else if received == RESTART_SIGNAL_SERVER {
                     log_message(&format!("📨 Received reboot signal from {}", src), is_prod);
                     ServerCmd::RestartSERVER.store(&server_cmd_clone);
                             
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
+                } else if received == RESTART_SIGNAL_GOAHEAD {
+                    log_message(&format!("📨 Received restart goahead signal from {}", src), is_prod);
+                    ServerCmd::RestartGoAhead.store(&server_cmd_clone);
+                            
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
+                } else if received == REDUCE_KERNEL_LOAD {
+                    log_message(&format!("📨 Received reduce kernel load signal from {}", src), is_prod);
+                    ServerCmd::ReduceKernelLoad.store(&server_cmd_clone);
+                            
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
+                } else if received == ENABLE_KMSG_MONITOR {
+                    log_message(&format!("📨 Received enable kmsg monitor signal from {}", src), is_prod);
+                    ServerCmd::EnableKmsgMonitor.store(&server_cmd_clone);
+                    
+                    // 发送确认响应
+                    let _ = signal_sock.send_to(b"OK", src);
+                } else if received == DISABLE_KMSG_MONITOR {
+                    log_message(&format!("📨 Received disable kmsg monitor signal from {}", src), is_prod);
+                    ServerCmd::DisableKmsgMonitor.store(&server_cmd_clone);
+                    
                     // 发送确认响应
                     let _ = signal_sock.send_to(b"OK", src);
                 } else if received == SIGNAL_PING {
@@ -197,6 +378,138 @@ fn main() {
             ServerCmd::RestartSERVER => {
                 server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
                 reboot_system(is_prod);
+            }
+            ServerCmd::DisableADB => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                match disable_adb_function(is_prod) {
+                    Ok(_) => {
+                        log_message("✅ adb function disabled successfully", is_prod);
+                        send_udp_notification("ADB_FUNCTION_DISABLED", target_ip.clone(), is_prod);
+                    }
+                    Err(e) => {
+                        log_message(&format!("❌ Failed to disable adb function: {}", e), is_prod);
+                    }
+                }
+            }
+            ServerCmd::RestartGoAhead => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                match force_start_goahead_process(is_prod) {
+                    Ok(_) => {
+                        log_message("✅ goahead force restarted successfully", is_prod);
+                        send_udp_notification("GOAHEAD_FORCE_RESTARTED", target_ip.clone(), is_prod);
+                    }
+                    Err(e) => {
+                        log_message(&format!("❌ Failed to force restart goahead: {}", e), is_prod);
+                    }
+                }
+            }
+            ServerCmd::ReduceKernelLoad => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                let mut zte_count = 0;
+                let mut high_prio_count = 0;
+                let mut cpu_hog_count = 0;
+                
+                if let Ok(entries) = fs::read_dir("/proc") {
+                    for entry in entries.flatten() {
+                        let file_name = entry.file_name();
+                        let name_str = file_name.to_string_lossy();
+                        
+                        if name_str.chars().all(|c| c.is_ascii_digit()) {
+                            let pid = match name_str.parse::<u32>() {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            
+                            // 1. 处理 zte 进程 (nice=15)
+                            let cmdline_path = format!("/proc/{}/cmdline", name_str);
+                            if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
+                                if cmdline_content.contains("goahead") {
+                                    match ProcessPriority::set_nice(pid, 10) {
+                                        Ok(_) => {
+                                            log_message(&format!("Set gohead process (PID: {}) priority to nice=15", pid), is_prod);
+                                            zte_count += 1;
+                                        }
+                                        Err(e) => {
+                                            log_message(&format!("Failed to set goahead process (PID: {}) priority: {}", pid, e), is_prod);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if cmdline_content.contains("zte") {
+                                    match ProcessPriority::set_nice(pid, 5) {
+                                        Ok(_) => {
+                                            log_message(&format!("Set zte process (PID: {}) priority to nice=10", pid), is_prod);
+                                            zte_count += 1;
+                                        }
+                                        Err(e) => {
+                                            log_message(&format!("Failed to set zte process (PID: {}) priority: {}", pid, e), is_prod);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            
+                            // 2. 获取进程名和当前 nice 值
+                            let comm_path = format!("/proc/{}/comm", name_str);
+                            let stat_path = format!("/proc/{}/stat", name_str);
+                            
+                            if let Ok(comm) = fs::read_to_string(&comm_path) {
+                                let comm = comm.trim();
+                                
+                                // 2a. 处理 ksoftirqd 和 dwc_otg_thread (nice=-5)
+                                if comm.contains("ksoftirqd") || comm.contains("dwc_otg_thread") {
+                                    match ProcessPriority::set_nice(pid, -5) {
+                                        Ok(_) => {
+                                            log_message(&format!("Reduced {} (PID: {}) priority to nice=-10", comm, pid), is_prod);
+                                            cpu_hog_count += 1;
+                                        }
+                                        Err(e) => {
+                                            log_message(&format!("Failed to reduce {} (PID: {}) priority: {}", comm, pid, e), is_prod);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                
+                                // 2b. 处理 nice=-20 的进程 (改为 nice=0)
+                                if let Ok(stat_content) = fs::read_to_string(&stat_path) {
+                                    // stat 格式: pid (comm) state ... priority nice ...
+                                    // nice 是第 19 个字段
+                                    let parts: Vec<&str> = stat_content.split_whitespace().collect();
+                                    if parts.len() >= 19 {
+                                        if let Ok(current_nice) = parts[18].parse::<i32>() {
+                                            if current_nice == -20 {
+                                                match ProcessPriority::set_nice(pid, 0) {
+                                                    Ok(_) => {
+                                                        log_message(&format!("Adjusted {} (PID: {}) priority from -20 to 0", comm, pid), is_prod);
+                                                        high_prio_count += 1;
+                                                    }
+                                                    Err(e) => {
+                                                        log_message(&format!("Failed to adjust {} (PID: {}) priority: {}", comm, pid, e), is_prod);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                log_message(&format!("Kernel load reduction complete: zte={}, high_prio_adjusted={}, cpu_hogs={}", 
+                    zte_count, high_prio_count, cpu_hog_count), is_prod);
+                send_udp_notification(&format!("KERNEL_LOAD_REDUCED: ZTE={} HIGH_PRIO={} CPU_HOGS={}", 
+                    zte_count, high_prio_count, cpu_hog_count), target_ip.clone(), is_prod);
+            }
+            ServerCmd::EnableKmsgMonitor => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                kmsg_monitor.enable(is_prod);
+                send_udp_notification("KMSG_MONITOR_ENABLED", target_ip.clone(), is_prod);
+            }
+            ServerCmd::DisableKmsgMonitor => {
+                server_cmd.store(ServerCmd::None as u8, Ordering::Relaxed);
+                kmsg_monitor.disable(is_prod);
+                send_udp_notification("KMSG_MONITOR_DISABLED", target_ip.clone(), is_prod);
             }
             ServerCmd::None => {}
         }
@@ -309,34 +622,11 @@ fn main() {
             last_network_check = now;
         }
 
-       // adbd进程检查 - 每10秒一次
-        // if now.duration_since(last_adbd_check) >= Duration::from_secs(ADBD_CHECK_INTERVAL) {
-        //     match check_and_start_adbd(is_prod) {
-        //         Ok(restarted) => {
-        //             if restarted {
-        //                 log_message("✅ adbd process was restarted", is_prod);
-        //                 // 发送adbd重启通知
-        //                 send_udp_notification("ADBD_RESTARTED", target_ip.clone() ,is_prod);
-        //             }
-        //         }
-        //         Err(e) => {
-        //             log_message(&format!("❌ adbd check failed: {}", e), is_prod);
-        //         }
-        //     }
-        //     last_adbd_check = now;
-        // }
-
-        // if now.duration_since(last_log_prune) >= Duration::from_secs(DAY_INTERVAL) {
-        //     if let Err(e) = fs::write("/etc_rw/zxping.log", "") {
-        //         log_message(&format!("Failed to clear zxping.log: {}", e), is_prod);
-        //     } else {
-        //         log_message("zxping.log cleared", is_prod);
-        //     }
-        //     last_log_prune = now;
-        // }
+        // KMSG 监控检查（在主循环中处理，无线程开销）
+        kmsg_monitor.check(&target_ip, is_prod);
 
         // 睡眠1秒后继续检查，避免忙等待
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -384,15 +674,7 @@ fn reset_android_usb(is_prod: bool) {
 fn throttle_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
     let commands = [
-        // "echo 800 > /proc/sys/net/core/netdev_max_backlog",
-        // "echo 3000 > /proc/sys/net/unix/max_dgram_qlen",
         "echo 3500 > /proc/sys/net/nf_conntrack_max",
-        // "echo 150 > /proc/sys/net/ipv4/tcp_max_syn_backlog",
-
-        // "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
-        // "echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time",
-        // "echo 5 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
-        // "echo 900 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
     ];
     for cmd in commands.iter() {
         if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
@@ -407,12 +689,6 @@ fn restore_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
 
     let commands = [
-        // "echo 1000 > /proc/sys/net/core/netdev_max_backlog",
-        // "echo 5000 > /proc/sys/net/unix/max_dgram_qlen",
-        // "echo 5 > /proc/sys/net/ipv4/tcp_retries2",
-        // "echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time",
-        // "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait",
-        // "echo 1800 > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established",
         "echo 4096 > /proc/sys/net/nf_conntrack_max",
     ];
 
@@ -521,7 +797,6 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
 
         "echo 600 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established",
         "echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent",
-        "echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent2",
         "echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_recv",
 
         "echo 30 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait",
@@ -538,6 +813,73 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
 
         "echo 100 > /proc/sys/net/netfilter/nf_conntrack_generic_timeout",
         //"echo 0 > /proc/sys/net/ipv4/tcp_window_scaling"
+        // "echo 1 > /proc/net/fastnat_level"
+
+        // ========== IP分片重组优化 ==========
+        "echo 131072 > /proc/sys/net/ipv4/ipfrag_low_thresh",
+        "echo 196608 > /proc/sys/net/ipv4/ipfrag_high_thresh",
+        "echo 20 > /proc/sys/net/ipv4/ipfrag_time",
+
+        // ========== TCP内存极致压缩 ==========
+        "echo 256 512 768 > /proc/sys/net/ipv4/tcp_mem",
+        "echo 4096 8192 32768 > /proc/sys/net/ipv4/tcp_rmem",
+        "echo 4096 8192 32768 > /proc/sys/net/ipv4/tcp_wmem",
+        "echo 64 > /proc/sys/net/ipv4/tcp_max_orphans",
+        "echo 128 > /proc/sys/net/ipv4/tcp_max_tw_buckets",
+
+        // ========== TCP保活与重传 ==========
+        "echo 3 > /proc/sys/net/ipv4/tcp_keepalive_probes",
+        "echo 5 > /proc/sys/net/ipv4/tcp_syn_retries",
+        "echo 5 > /proc/sys/net/ipv4/tcp_synack_retries",
+        "echo 0 > /proc/sys/net/ipv4/tcp_slow_start_after_idle",
+
+        // ========== 路由表精简 ==========
+        "echo 4096 > /proc/sys/net/ipv4/route/max_size",
+        "echo 256 > /proc/sys/net/ipv4/route/gc_thresh",
+        "echo 60 > /proc/sys/net/ipv4/route/gc_timeout",
+
+        // ========== ARP/邻居表压缩 ==========
+        "echo 256 > /proc/sys/net/ipv4/neigh/default/gc_thresh1",
+        "echo 512 > /proc/sys/net/ipv4/neigh/default/gc_thresh2",
+        "echo 2048 > /proc/sys/net/ipv4/neigh/default/gc_thresh3",
+        "echo 15 > /proc/sys/net/ipv4/neigh/default/base_reachable_time",
+
+        // ========== UDP内存压缩 ==========
+        "echo 256 512 768 > /proc/sys/net/ipv4/udp_mem",
+        "echo 2048 > /proc/sys/net/ipv4/udp_rmem_min",
+        "echo 2048 > /proc/sys/net/ipv4/udp_wmem_min",
+
+        // ========== 杂项精简 ==========
+        "echo 5 > /proc/sys/net/ipv4/igmp_max_memberships",
+        "echo 8192 > /proc/sys/net/ipv4/inet_peer_threshold",
+        "echo 300 > /proc/sys/net/ipv4/inet_peer_maxttl",
+
+        // ========== ICMP限速 ==========
+        "echo 100 > /proc/sys/net/ipv4/icmp_ratelimit",
+        "echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts",
+
+        // ========== Kernel核心参数 ==========
+        "echo 0 > /proc/sys/kernel/randomize_va_space",
+        "echo 0 > /proc/sys/kernel/panic_on_oops",
+        "echo '|/bin/false' > /proc/sys/kernel/core_pattern",
+        "echo 0 > /proc/sys/kernel/core_uses_pid",
+        "echo 1 1 1 1 > /proc/sys/kernel/printk",
+        "echo 0 > /proc/sys/kernel/sysrq",
+        "echo 256 > /proc/sys/kernel/threads-max",
+        "echo 4096 > /proc/sys/kernel/msgmnb",
+        "echo 96 > /proc/sys/kernel/msgmni",
+
+        // ========== VM内存管理 ==========
+        "echo 0 > /proc/sys/vm/panic_on_oom",
+        "echo 2048 > /proc/sys/vm/min_free_kbytes",
+
+        // ========== 实时内核优化 ==========
+        "echo 200000 > /proc/sys/kernel/sched_rt_period_us",
+
+        "echo 8192 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_max",
+        "echo 4096 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit",
+        "echo 1024 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_min",
+        "echo 200 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/hold_time"
     ];
 
     if !br_network.is_empty() && !wan1_ip.is_empty() {
@@ -554,6 +896,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
             "ip6tables -F".to_string(),
             "ifconfig wan1 txqueuelen 100".to_string(),
             "ifconfig br0 txqueuelen 500".to_string(),
+            "ifconfig usblan0 txqueuelen 100".to_string(),
         ];
         for cmd in &ipt_cmds {
             if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
@@ -593,8 +936,8 @@ fn daemonize_simple(is_prod: bool) {
         .read(true)
         .write(true)
         // .open(stdout)
-        .open("/dev/null")
-        // .open("/etc_rw/zxping.log")
+        // .open("/dev/null")
+        .open("/etc_rw/zxping.log")
         .expect(&format!("cannot open {}", stdout));
 
     Daemonize::new()
@@ -710,50 +1053,6 @@ fn log_message(message: &str, is_prod: bool) {
         println!("[{}] {}", timestamp, message);
     }
 }
- 
-// 监听重启信号的轻量级UDP服务器
-// fn listen_for_signal(cmd: Arc<AtomicU8>, is_prod: bool) {
-//     match UdpSocket::bind(("0.0.0.0", SIGNAL_LISTEN_PORT)) {
-//         Ok(socket) => {
-//             log_message(&format!("📡 Signal listener started on port {}", SIGNAL_LISTEN_PORT), is_prod);
-            
-//             let mut buf = [0u8; 64];
-            
-//             loop {
-//                 match socket.recv_from(&mut buf) {
-//                     Ok((size, src)) => {
-//                         let received = &buf[..size];
-                        
-//                         if received == RESTART_SIGNAL_ADBD {
-//                             log_message(&format!("📨 Received restart signal from {}", src), is_prod);
-//                             ServerCmd::RestartADB.store(&cmd);
-//                             // 发送确认响应
-//                             let _ = socket.send_to(b"OK", src);
-//                         }
-//                         if received == KILL_SIGNAL_ADBD {
-//                             log_message(&format!("📨 Received kill signal from {}", src), is_prod);
-//                             ServerCmd::KillADB.store(&cmd);
-                            
-//                             // 发送确认响应
-//                             let _ = socket.send_to(b"OK", src);
-//                         }
-//                     }
-//                     Err(e) => {
-//                         if !is_prod {
-//                             log_message(&format!("❌ Signal listener error: {}", e), is_prod);
-//                         }
-//                     }
-//                 }
-                
-//                 // 清空缓冲区
-//                 buf.fill(0);
-//             }
-//         }
-//         Err(e) => {
-//             log_message(&format!("❌ Failed to start signal listener: {}", e), is_prod);
-//         }
-//     }
-// }
 
 
 // 强制重启adbd进程
@@ -788,28 +1087,24 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
     thread::sleep(Duration::from_secs(3));
     
     // 3. 启动新的adbd进程
-    let status = Command::new("/bin/adbd")
+    let mut child = Command::new("/bin/adbd")
         .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
         .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
-        .status()
-        .map_err(|e| format!("Failed to start adbd: {}", e));
-        // .or_else(|_| {
-        //     Command::new("/bin/adbd")
-        //         .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
-        //         .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
-        //         .status()
-        //         .map_err(|e| format!("Failed to start adbd: {}", e))
-        // });
+        .spawn()
+        .map_err(|e| format!("Failed to start adbd: {}", e))?;
     
-    match status {
-        Ok(_) => {
-            log_message("adbd force restarted successfully", is_prod);
-            Ok(())
-        }
-        Err(e) => {
-            Err(format!("Failed to force restart adbd: {}", e))
-        }
+    // 4. 设置子进程优先级
+    let pid = child.id();
+    log_message(&format!("set adbd pid={} pri", pid), is_prod);
+    if let Err(e) = ProcessPriority::set_nice(pid, 15) {
+        log_message(&format!("Warning: Could not set priority for adbd: {}", e), is_prod);
+    } else {
+        log_message(&format!("Set adbd (PID: {}) priority to nice={}", pid, 15), is_prod);
     }
+    
+    log_message("adbd force restarted successfully", is_prod);
+    re_enable_adb_function(is_prod);
+    Ok(())
 }
 
 pub fn force_start_goahead_process(is_prod: bool) -> Result<(), String> {
@@ -837,89 +1132,6 @@ pub fn force_start_goahead_process(is_prod: bool) -> Result<(), String> {
         log_message("goahead force restarted successfully", is_prod);
         Ok(())
 }
-
-// 同时修复 check_and_start_adbd 函数中的相同问题
-// fn check_and_start_adbd(is_prod: bool) -> Result<bool, String> {
-//     let mut adbd_found = false;
-//     let mut adbd_pid = String::new();
-
-//     if let Ok(entries) = fs::read_dir("/proc") {
-//         for entry in entries.flatten() {
-//             let file_name = entry.file_name();
-//             let name_str = file_name.to_string_lossy();
-            
-//             if name_str.chars().all(|c| c.is_ascii_digit()) {
-//                 let cmdline_path = format!("/proc/{}/cmdline", name_str);
-//                 if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
-//                     if cmdline_content.contains("adbd") {
-//                         adbd_found = true;
-//                         // 修复：将 Cow<'_, str> 转换为 String
-//                         adbd_pid = name_str.to_string();
-                        
-//                         let stat_path = format!("/proc/{}/stat", adbd_pid);
-//                         if let Ok(stat_content) = fs::read_to_string(&stat_path) {
-//                             let parts: Vec<&str> = stat_content.split_whitespace().collect();
-//                             if parts.len() > 2 {
-//                                 let state = parts[2];
-//                                 if state == "R" || state == "S" {
-//                                     if !is_prod {
-//                                         log_message(&format!("adbd is running (PID: {}, State: {})", adbd_pid, state), is_prod);
-//                                     }
-//                                     return Ok(false);
-//                                 } else {
-//                                     log_message(&format!("adbd process exists but state is {} (not running properly)", state), is_prod);
-//                                     continue;
-//                                 }
-//                             }
-//                         }
-//                         break;
-//                     }
-//                 }
-//             }
-//         }
-//     } else {
-//         return Err("Failed to read /proc directory".to_string());
-//     }
-
-//     if adbd_found {
-//         log_message(&format!("adbd process (PID: {}) exists but not in running state, attempting to restart...", adbd_pid), is_prod);
-        
-//         // 修复：这里也需要转换
-//         if let Ok(_) = Command::new("kill")
-//             .arg("-9")
-//             .arg(&adbd_pid)
-//             .status() 
-//         {
-//             log_message(&format!("Killed abnormal adbd process (PID: {})", adbd_pid), is_prod);
-//             thread::sleep(Duration::from_secs(1));
-//         }
-//     } else {
-//         log_message("adbd not found in /proc, attempting to start...", is_prod);
-//     }
-    
-//     let status = Command::new("adbd")
-//         .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
-//         .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
-//         .status()
-//         .or_else(|_| {
-//             Command::new("/bin/adbd")
-//                 .stdout(Stdio::null())  // 标准输出重定向到 /dev/null
-//                 .stderr(Stdio::null())  // 标准错误重定向到 /dev/null
-//                 .status()
-//                 .map_err(|e| format!("Failed to start adbd: {}", e))
-//         });
-    
-//     match status {
-//         Ok(_) => {
-//             log_message("adbd started successfully", is_prod);
-//             Ok(true)
-//         }
-//         Err(e) => {
-//             Err(format!("Failed to start adbd: {}", e))
-//         }
-//     }
-// }
-
 
 
 // 强制重启adbd进程
@@ -954,4 +1166,67 @@ fn force_kill_process(is_prod: bool, process_name: &str) -> Result<(), String> {
     thread::sleep(Duration::from_secs(1));
 
     return Ok(())
+}
+
+// 禁用 ADB 功能（通过修改 USB 配置）
+fn disable_adb_function(is_prod: bool) -> Result<(), String> {
+    log_message("Disabling ADB function via USB configuration...", is_prod);
+    
+    let commands = [
+        "echo 0 > /sys/class/android_usb/android0/enable",
+        "echo ecm > /sys/class/android_usb/android0/functions",
+        "echo 1 > /sys/class/android_usb/android0/enable",
+        "echo 8192 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_max",
+        "echo 4096 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit",
+        "echo 1024 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_min",
+        "echo 200 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/hold_time"
+    ];
+    
+    for cmd in commands.iter() {
+        match Command::new("sh").arg("-c").arg(cmd).status() {
+            Ok(status) => {
+                if !status.success() {
+                    log_message(&format!("Warning: command may have failed: {}", cmd), is_prod);
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to execute '{}': {}", cmd, e));
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    
+    log_message("ADB function disabled, USB now in ECM mode only", is_prod);
+    Ok(())
+}
+
+fn re_enable_adb_function(is_prod: bool) -> Result<(), String> {
+    log_message("Disabling ADB function via USB configuration...", is_prod);
+    
+    let commands = [
+        "echo 0 > /sys/class/android_usb/android0/enable",
+        "echo ecm,adb > /sys/class/android_usb/android0/functions",
+        "echo 1 > /sys/class/android_usb/android0/enable",
+        "echo 8192 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_max",
+        "echo 4096 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit",
+        "echo 1024 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_min",
+        "echo 200 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/hold_time"
+    ];
+    
+    for cmd in commands.iter() {
+        match Command::new("sh").arg("-c").arg(cmd).status() {
+            Ok(status) => {
+                if !status.success() {
+                    log_message(&format!("Warning: command may have failed: {}", cmd), is_prod);
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to execute '{}': {}", cmd, e));
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    
+    log_message("ADB function disabled, USB now in ECM mode only", is_prod);
+    Ok(())
 }
