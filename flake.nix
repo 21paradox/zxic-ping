@@ -3,10 +3,11 @@
   # nix develop .#zxic --extra-experimental-features "nix-command flakes"
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/85dbfc7aaf52ecb755f87e577ddbe6dbbdbc1054";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
-      url = "github:oxalica/rust-overlay";
+      url = "path:/mnt/nvme1/swz/git/rust-overlay";
+      # url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -47,7 +48,7 @@
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABI_LINKER = "${crossGcc}/bin/armv7l-unknown-linux-musleabi-gcc";
           # CURL_CA_BUNDLE      = "${basePkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           # CARGO_NET_CAINFO    = "${basePkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-          SSL_CERT_FILE = "${basePkgs.cacert}/etc/ssl/certs/ca-bund";
+          SSL_CERT_FILE = "${basePkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         };
 
         # 开发环境

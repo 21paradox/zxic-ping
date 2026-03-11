@@ -32,3 +32,6 @@ nv set usb_devices_debug=adb
 nv set select_type=select_cdc
 
 ```
+
+
+ps -eo pid,comm,nice,args

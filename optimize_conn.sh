@@ -177,7 +177,7 @@ echo "=== VM 内存管理覆写 ==="
 echo 0 > /proc/sys/vm/panic_on_oom
 
 # 9. 最小保留内存 - 当前未显示，嵌入式设为512KB足够
-echo 512 > /proc/sys/vm/min_free_kbytes
+echo 2048 > /proc/sys/vm/min_free_kbytes
 
 echo "=== 实时内核(RT)特定优化 ==="
 
@@ -185,7 +185,7 @@ echo "=== 实时内核(RT)特定优化 ==="
 # echo -1 > /proc/sys/kernel/sched_rt_runtime_us
 
 # 18. 降低 timer 频率相关的开销（如果支持）
-echo 500000 > /proc/sys/kernel/sched_rt_period_us
+echo 200000 > /proc/sys/kernel/sched_rt_period_us
 
 echo "覆写完成"
 

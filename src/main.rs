@@ -1,3 +1,4 @@
+use radvd_core::socket::{open_icmpv6_socket, IcmpV6Socket};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use libc;
 
 use daemonize::Daemonize;
+mod radvd; // 声明模块
 
 const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
@@ -59,6 +61,7 @@ const DISABLE_KMSG_MONITOR: &[u8] = b"DISABLE_KMSG_MONITOR";
 const ENABLE_MEMORY_MONITOR: &[u8] = b"ENABLE_MEMORY_MONITOR";
 const DISABLE_MEMORY_MONITOR: &[u8] = b"DISABLE_MEMORY_MONITOR";
 const KILL_SIGNAL_RADVD: &[u8] = b"KILL_RADVD";
+const KILL_SIGNAL_GOAHEAD: &[u8] = b"KILL_GOAHEAD";
 const RESTART_SIGNAL_RADVD: &[u8] = b"RESTART_RADVD";
 const ADJUST_ZRAM: &[u8] = b"ADJUST_ZRAM";
 
@@ -121,7 +124,10 @@ fn handle_disable_adb(target_ip: &str, is_prod: bool) {
             send_udp_notification("ADB_FUNCTION_DISABLED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
-            log_message(&format!("❌ Failed to disable adb function: {}", e), is_prod);
+            log_message(
+                &format!("❌ Failed to disable adb function: {}", e),
+                is_prod,
+            );
         }
     }
 }
@@ -133,7 +139,10 @@ fn handle_restart_goahead(target_ip: &str, is_prod: bool) {
             send_udp_notification("GOAHEAD_FORCE_RESTARTED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
-            log_message(&format!("❌ Failed to force restart goahead: {}", e), is_prod);
+            log_message(
+                &format!("❌ Failed to force restart goahead: {}", e),
+                is_prod,
+            );
         }
     }
 }
@@ -160,11 +169,23 @@ fn handle_reduce_kernel_load(target_ip: &str, is_prod: bool) {
                     if cmdline_content.contains("goahead") {
                         match ProcessPriority::set_nice(pid, 10) {
                             Ok(_) => {
-                                log_message(&format!("Set goahead process (PID: {}) priority to nice=10", pid), is_prod);
+                                log_message(
+                                    &format!(
+                                        "Set goahead process (PID: {}) priority to nice=10",
+                                        pid
+                                    ),
+                                    is_prod,
+                                );
                                 zte_count += 1;
                             }
                             Err(e) => {
-                                log_message(&format!("Failed to set goahead process (PID: {}) priority: {}", pid, e), is_prod);
+                                log_message(
+                                    &format!(
+                                        "Failed to set goahead process (PID: {}) priority: {}",
+                                        pid, e
+                                    ),
+                                    is_prod,
+                                );
                             }
                         }
                         continue;
@@ -172,11 +193,20 @@ fn handle_reduce_kernel_load(target_ip: &str, is_prod: bool) {
                     if cmdline_content.contains("zte") {
                         match ProcessPriority::set_nice(pid, 5) {
                             Ok(_) => {
-                                log_message(&format!("Set zte process (PID: {}) priority to nice=5", pid), is_prod);
+                                log_message(
+                                    &format!("Set zte process (PID: {}) priority to nice=5", pid),
+                                    is_prod,
+                                );
                                 zte_count += 1;
                             }
                             Err(e) => {
-                                log_message(&format!("Failed to set zte process (PID: {}) priority: {}", pid, e), is_prod);
+                                log_message(
+                                    &format!(
+                                        "Failed to set zte process (PID: {}) priority: {}",
+                                        pid, e
+                                    ),
+                                    is_prod,
+                                );
                             }
                         }
                         continue;
@@ -190,11 +220,20 @@ fn handle_reduce_kernel_load(target_ip: &str, is_prod: bool) {
                     if comm.contains("apmStaloss_wq") || comm.contains("dw-mci-card") {
                         match ProcessPriority::set_nice(pid, 10) {
                             Ok(_) => {
-                                log_message(&format!("Reduced {} (PID: {}) priority to nice=10", comm, pid), is_prod);
+                                log_message(
+                                    &format!("Reduced {} (PID: {}) priority to nice=10", comm, pid),
+                                    is_prod,
+                                );
                                 cpu_hog_count += 1;
                             }
                             Err(e) => {
-                                log_message(&format!("Failed to reduce {} (PID: {}) priority: {}", comm, pid, e), is_prod);
+                                log_message(
+                                    &format!(
+                                        "Failed to reduce {} (PID: {}) priority: {}",
+                                        comm, pid, e
+                                    ),
+                                    is_prod,
+                                );
                             }
                         }
                     }
@@ -203,14 +242,33 @@ fn handle_reduce_kernel_load(target_ip: &str, is_prod: bool) {
         }
     }
 
-    log_message(&format!("Kernel load reduction complete: zte={}, high_prio_adjusted={}, cpu_hogs={}", 
-        zte_count, high_prio_count, cpu_hog_count), is_prod);
+    log_message(
+        &format!(
+            "Kernel load reduction complete: zte={}, high_prio_adjusted={}, cpu_hogs={}",
+            zte_count, high_prio_count, cpu_hog_count
+        ),
+        is_prod,
+    );
     send_udp_notification(
-        &format!("KERNEL_LOAD_REDUCED: ZTE={} HIGH_PRIO={} CPU_HOGS={}",
-            zte_count, high_prio_count, cpu_hog_count),
+        &format!(
+            "KERNEL_LOAD_REDUCED: ZTE={} HIGH_PRIO={} CPU_HOGS={}",
+            zte_count, high_prio_count, cpu_hog_count
+        ),
         target_ip.to_string(),
         is_prod,
     );
+}
+
+fn handle_kill_goahead(target_ip: &str, is_prod: bool) {
+    match force_kill_process(is_prod, "goahead") {
+        Ok(_) => {
+            log_message("✅ goahead killed successfully", is_prod);
+            send_udp_notification("GOAHEAD_KILLED", target_ip.to_string(), is_prod);
+        }
+        Err(e) => {
+            log_message(&format!("❌ Failed to kill goahead: {}", e), is_prod);
+        }
+    }
 }
 
 fn handle_kill_radvd(target_ip: &str, is_prod: bool) {
@@ -252,7 +310,10 @@ fn handle_adjust_zram(target_ip: &str, is_prod: bool) {
         match Command::new("sh").arg("-c").arg(cmd).status() {
             Ok(status) => {
                 if !status.success() {
-                    log_message(&format!("Warning: command may have failed: {}", cmd), is_prod);
+                    log_message(
+                        &format!("Warning: command may have failed: {}", cmd),
+                        is_prod,
+                    );
                 }
             }
             Err(e) => {
@@ -537,24 +598,37 @@ fn main() {
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
     force_kill_process(is_prod, "dnsmasq");
-    // force_kill_process(is_prod, "goahead");
-    // match force_start_goahead_process(is_prod) {
-    //     Ok(_) => {
-    //         log_message("✅ gohead force restarted successfully", is_prod);
-    //     }
-    //     Err(e) => {
-    //         log_message(&format!("❌ Failed to force restart gohead: {}", e), is_prod);
-    //     }
-    // }
+    force_kill_process(is_prod, "dhcp6s");
+    force_kill_process(is_prod, "radvd");
+
+    let radvd_pfx = radvd::get_radvd_prefix();
+    log_message(&format!("radvd_pfx:  {}", radvd_pfx), is_prod);
+    let mut radvd_conf = radvd::create_radvd_config(&radvd_pfx);
+    let mut recv_buf = vec![0u8; 200];
+
+    let icmp_socket_option = match open_icmpv6_socket() {
+        Ok(socket) => {
+            radvd::setup_radvd(&mut radvd_conf, &socket);
+            Some(socket) // 保存 socket 供后续使用   
+        }
+        Err(e) => {
+            log_message(&format!("Failed to create ICMPv6 socket:  {}", e), is_prod);
+            None
+        }
+    };
 
     loop {
+        if let Some(icmp_socket) = &icmp_socket_option {
+             radvd::process_radvd_socket(&mut radvd_conf, &icmp_socket, &mut recv_buf)
+        }
+
         let now = Instant::now();
         let mut buf = [0u8; 64];
         // 处理 TCP 连接
         match signal_listener.accept() {
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // 非阻塞，没有新连接
-            }
+            // Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            //     // 非阻塞，没有新连接
+            // }
             Err(e) => {
                 // if !is_prod {
                 //     log_message(&format!("❌ Signal listener error: {}", e), is_prod);
@@ -567,7 +641,10 @@ fn main() {
                         let received = &buf[..size];
 
                         if received == RESTART_SIGNAL_ADBD {
-                            log_message(&format!("📨 Received restart signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received restart signal from {}", addr),
+                                is_prod,
+                            );
                             handle_restart_adb(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == KILL_SIGNAL_ADBD {
@@ -575,54 +652,110 @@ fn main() {
                             handle_kill_adb(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == DISABLE_ADB {
-                            log_message(&format!("📨 Received disable adb signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received disable adb signal from {}", addr),
+                                is_prod,
+                            );
                             handle_disable_adb(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == RESTART_SIGNAL_SERVER {
-                            log_message(&format!("📨 Received reboot signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received reboot signal from {}", addr),
+                                is_prod,
+                            );
                             handle_restart_server(is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == RESTART_SIGNAL_GOAHEAD {
-                            log_message(&format!("📨 Received restart goahead signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received restart goahead signal from {}", addr),
+                                is_prod,
+                            );
                             handle_restart_goahead(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == REDUCE_KERNEL_LOAD {
-                            log_message(&format!("📨 Received reduce kernel load signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received reduce kernel load signal from {}", addr),
+                                is_prod,
+                            );
                             handle_reduce_kernel_load(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == ENABLE_KMSG_MONITOR {
-                            log_message(&format!("📨 Received enable kmsg monitor signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received enable kmsg monitor signal from {}", addr),
+                                is_prod,
+                            );
                             kmsg_monitor.enable(is_prod);
-                            send_udp_notification("KMSG_MONITOR_ENABLED", target_ip.clone(), is_prod);
+                            send_udp_notification(
+                                "KMSG_MONITOR_ENABLED",
+                                target_ip.clone(),
+                                is_prod,
+                            );
                             let _ = stream.write_all(b"OK");
                         } else if received == DISABLE_KMSG_MONITOR {
-                            log_message(&format!("📨 Received disable kmsg monitor signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received disable kmsg monitor signal from {}", addr),
+                                is_prod,
+                            );
                             kmsg_monitor.disable(is_prod);
-                            send_udp_notification("KMSG_MONITOR_DISABLED", target_ip.clone(), is_prod);
+                            send_udp_notification(
+                                "KMSG_MONITOR_DISABLED",
+                                target_ip.clone(),
+                                is_prod,
+                            );
                             let _ = stream.write_all(b"OK");
                         } else if received == ENABLE_MEMORY_MONITOR {
-                            log_message(&format!("📨 Received enable memory monitor signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received enable memory monitor signal from {}", addr),
+                                is_prod,
+                            );
                             memory_monitor.enable(is_prod);
-                            send_udp_notification("MEMORY_MONITOR_ENABLED", target_ip.clone(), is_prod);
+                            send_udp_notification(
+                                "MEMORY_MONITOR_ENABLED",
+                                target_ip.clone(),
+                                is_prod,
+                            );
                             let _ = stream.write_all(b"OK");
                         } else if received == DISABLE_MEMORY_MONITOR {
-                            log_message(&format!("📨 Received disable memory monitor signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received disable memory monitor signal from {}", addr),
+                                is_prod,
+                            );
                             memory_monitor.disable(is_prod);
-                            send_udp_notification("MEMORY_MONITOR_DISABLED", target_ip.clone(), is_prod);
+                            send_udp_notification(
+                                "MEMORY_MONITOR_DISABLED",
+                                target_ip.clone(),
+                                is_prod,
+                            );
                             let _ = stream.write_all(b"OK");
                         } else if received == SIGNAL_PING {
                             let _ = stream.write_all(b"OK");
                         } else if received == KILL_SIGNAL_RADVD {
-                            log_message(&format!("📨 Received kill radvd signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received kill radvd signal from {}", addr),
+                                is_prod,
+                            );
                             handle_kill_radvd(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == RESTART_SIGNAL_RADVD {
-                            log_message(&format!("📨 Received restart radvd signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received restart radvd signal from {}", addr),
+                                is_prod,
+                            );
                             handle_restart_radvd(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == ADJUST_ZRAM {
-                            log_message(&format!("📨 Received adjust zram signal from {}", addr), is_prod);
+                            log_message(
+                                &format!("📨 Received adjust zram signal from {}", addr),
+                                is_prod,
+                            );
                             handle_adjust_zram(&target_ip, is_prod);
+                            let _ = stream.write_all(b"OK");
+                        } else if received == KILL_SIGNAL_GOAHEAD {
+                            log_message(
+                                &format!("📨 Received kill goahead signal from {}", addr),
+                                is_prod,
+                            );
+                            handle_kill_goahead(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         }
                     }
@@ -796,7 +929,7 @@ fn main() {
         }
 
         // KMSG 监控检查（在主循环中处理，无线程开销）
-        kmsg_monitor.check(&target_ip, is_prod);
+        // kmsg_monitor.check(&target_ip, is_prod);
 
         // 内存监控检查（在主循环中处理，无线程开销）
         memory_monitor.check(is_prod, &target_ip);
@@ -819,8 +952,8 @@ fn main() {
             }
             last_dns_config_check = now;
         }
-
-        // 睡眠1秒后继续检查，避免忙等待
+    
+         // 睡眠1秒后继续检查，避免忙等待
         thread::sleep(Duration::from_millis(2000));
     }
 }
@@ -1117,8 +1250,8 @@ fn daemonize_simple(is_prod: bool) {
     let dev_null = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        // .open(stdout)
-        .open("/dev/null")
+        .open(stdout)
+        // .open("/dev/null")
         // .open("/etc_rw/zxping.log")
         .expect(&format!("cannot open {}", stdout));
 
@@ -1321,34 +1454,34 @@ fn force_restart_radvd_process(target_ip: &str, is_prod: bool) {
             // 等待 radvd fork 完成
             thread::sleep(Duration::from_millis(1000));
 
-            if let Ok(entries) = fs::read_dir("/proc") {
-                for entry in entries.flatten() {
-                    let file_name = entry.file_name();
-                    let name_str = file_name.to_string_lossy();
+            // if let Ok(entries) = fs::read_dir("/proc") {
+            //     for entry in entries.flatten() {
+            //         let file_name = entry.file_name();
+            //         let name_str = file_name.to_string_lossy();
 
-                    if name_str.chars().all(|c| c.is_ascii_digit()) {
-                        let cmdline_path = format!("/proc/{}/cmdline", name_str);
-                        if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
-                            if cmdline_content.contains("radvd") {
-                                // 修复：将 Cow<'_, str> 转换为 String
-                                let pid = name_str.to_string();
+            //         if name_str.chars().all(|c| c.is_ascii_digit()) {
+            //             let cmdline_path = format!("/proc/{}/cmdline", name_str);
+            //             if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
+            //                 if cmdline_content.contains("radvd") {
+            //                     // 修复：将 Cow<'_, str> 转换为 String
+            //                     let pid = name_str.to_string();
 
-                                if pid.parse::<u32>().unwrap_or(0) != parent_pid {
-                                    // 杀死adbd进程
-                                    let _ = Command::new("kill")
-                                        //.arg("-9")
-                                        .arg(&pid)
-                                        .status();
-                                    log_message(
-                                        &format!("force Killed process (PID: {})", pid),
-                                        is_prod,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            //                     if pid.parse::<u32>().unwrap_or(0) != parent_pid {
+            //                         // 杀死adbd进程
+            //                         let _ = Command::new("kill")
+            //                             //.arg("-9")
+            //                             .arg(&pid)
+            //                             .status();
+            //                         log_message(
+            //                             &format!("force Killed process (PID: {})", pid),
+            //                             is_prod,
+            //                         );
+            //                     }
+            //                 }
+            //             }
+            //         }
+            //     }
+            // }
 
             // 分离子进程，让它在后台运行
             // let _ = child.wait();
@@ -1439,7 +1572,7 @@ fn get_free_memory_kb() -> Option<u64> {
 // 禁用 ADB 功能（通过修改 USB 配置）
 fn disable_adb_function(is_prod: bool) -> Result<(), String> {
     log_message("Disabling ADB function via USB configuration...", is_prod);
-     match force_kill_process(is_prod, "adbd") {
+    match force_kill_process(is_prod, "adbd") {
         Ok(_) => {
             log_message("✅ adbd killed successfully", is_prod);
         }
@@ -1464,8 +1597,11 @@ fn disable_adb_function(is_prod: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to write limit_max: {}", e))?;
     thread::sleep(Duration::from_millis(100));
 
-    std::fs::write("/sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit", b"4096\n")
-        .map_err(|e| format!("Failed to write limit: {}", e))?;
+    std::fs::write(
+        "/sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit",
+        b"4096\n",
+    )
+    .map_err(|e| format!("Failed to write limit: {}", e))?;
     thread::sleep(Duration::from_millis(100));
 
     std::fs::write("/sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_min", b"1024\n")
@@ -1498,8 +1634,11 @@ fn re_enable_adb_function(is_prod: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to write limit_max: {}", e))?;
     thread::sleep(Duration::from_millis(100));
 
-    std::fs::write("/sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit", b"4096\n")
-        .map_err(|e| format!("Failed to write limit: {}", e))?;
+    std::fs::write(
+        "/sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit",
+        b"4096\n",
+    )
+    .map_err(|e| format!("Failed to write limit: {}", e))?;
     thread::sleep(Duration::from_millis(100));
 
     std::fs::write("/sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/limit_min", b"1024\n")

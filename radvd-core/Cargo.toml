@@ -1,0 +1,15 @@
+[package]
+name = "radvd-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+thiserror = "1.0"
+tracing = "0.1"
+bytes = "1.5"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+socket2 = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]

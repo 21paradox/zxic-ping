@@ -20,17 +20,17 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1760038930,
-        "narHash": "sha256-Oncbh0UmHjSlxO7ErQDM3KM0A5/Znfofj2BSzlHLeVw=",
+        "lastModified": 1754725699,
+        "narHash": "sha256-iAcj9T/Y+3DBy2J0N+yF9XQQQ8IEb5swLFzs23CdP88=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "0b4defa2584313f3b781240b29d61f6f9f7e0df3",
+        "rev": "85dbfc7aaf52ecb755f87e577ddbe6dbbdbc1054",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "nixos-unstable",
         "repo": "nixpkgs",
+        "rev": "85dbfc7aaf52ecb755f87e577ddbe6dbbdbc1054",
         "type": "github"
       }
     },
@@ -48,17 +48,14 @@
         ]
       },
       "locked": {
-        "lastModified": 1760063676,
-        "narHash": "sha256-s5Fjh43skH2L+avOGioLmEHoYZffDbg3abV5h0gjeew=",
-        "owner": "oxalica",
-        "repo": "rust-overlay",
-        "rev": "897deed0923cc5a1d560c5176abe0d172ec9716d",
-        "type": "github"
+        "lastModified": 1772442118,
+        "narHash": "sha256-CyGo24oaz+CmJziSFXGmW13kiEuJgLqiJQc2CmH6xMA=",
+        "path": "/mnt/nvme1/swz/git/rust-overlay",
+        "type": "path"
       },
       "original": {
-        "owner": "oxalica",
-        "repo": "rust-overlay",
-        "type": "github"
+        "path": "/mnt/nvme1/swz/git/rust-overlay",
+        "type": "path"
       }
     },
     "systems": {
