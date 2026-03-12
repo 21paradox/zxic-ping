@@ -3,11 +3,12 @@
   # nix develop .#zxic --extra-experimental-features "nix-command flakes"
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/85dbfc7aaf52ecb755f87e577ddbe6dbbdbc1054";
+    # nixpkgs.url = "github:NixOS/nixpkgs/85dbfc7aaf52ecb755f87e577ddbe6dbbdbc1054";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
-      url = "path:/mnt/nvme1/swz/git/rust-overlay";
-      # url = "github:oxalica/rust-overlay";
+      # url = "path:/mnt/nvme1/swz/git/rust-overlay";
+      url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

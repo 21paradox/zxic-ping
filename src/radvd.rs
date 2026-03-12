@@ -351,10 +351,10 @@ fn process_packet(
             iface.props.name, e
         ));
     } else {
-        log(&format!(
-            "Sent solicited RA to {:?} for {}",
-            dest, iface.props.name
-        ));
+        // log(&format!(
+        //     "Sent solicited RA to {:?} for {}",
+        //     dest, iface.props.name
+        // ));
     }
 
     Ok(())
