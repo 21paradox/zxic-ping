@@ -32,7 +32,22 @@ pub fn create_radvd_config(prefixAddr: &str) -> Config {
     prefix.adv_preferred_lifetime = 120;
     iface.adv_prefix_list.push(prefix);
 
-    Config { interfaces: vec![iface] }
+    Config {
+        interfaces: vec![iface],
+    }
+}
+
+pub fn update_radvd_prefix(conf: &mut Config, new_prefix: &str) -> Result<(), String> {
+    if let Some(iface) = conf.interfaces.first_mut() {
+        if let Some(prefix) = iface.adv_prefix_list.first_mut() {
+            prefix.prefix = match new_prefix.parse() {
+                Ok(p) => p,
+                Err(_) => return Err("前缀格式错误".to_string()),
+            };
+            return Ok(());
+        }
+    }
+    Err("无法找到接口或前缀配置".to_string())
 }
 
 pub fn get_radvd_prefix() -> String {

@@ -25,6 +25,7 @@ const USB_HEALTH_CHECK_INTERVAL: u64 = 10; // USB健康检查间隔10秒
 const USB_WARNING_THRESHOLD: u32 = 3; // USB警告阈值
 const USB_CRITICAL_THRESHOLD: u32 = 2; // USB危险阈值
 const MEMORY_CHECK_INTERVAL: u64 = 10; // 内存检查间隔10秒
+const RADVD_PREFIX_CHECK_INTERVAL: u64 = 120; // CPU检查间隔30秒
 
 const MEMORY_LOW_THRESHOLD_KB: u64 = 1800; // 内存临界阈值2MB（小于此值杀进程）
 const MEMORY_CRITICAL_THRESHOLD_KB: u64 = 2400; // 内存临界阈值2MB（小于此值杀进程）
@@ -592,8 +593,9 @@ fn main() {
     let mut last_snat_check = Instant::now();
     // let mut last_udp_notification = Instant::now();
     // let mut last_adbd_check = Instant::now();
-    let mut last_log_prune = Instant::now();
+    // let mut last_log_prune = Instant::now();
     let mut last_dns_config_check = Instant::now();
+    let mut last_radvdprefix_check = Instant::now();
 
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
@@ -609,7 +611,7 @@ fn main() {
     let icmp_socket_option = match open_icmpv6_socket() {
         Ok(socket) => {
             radvd::setup_radvd(&mut radvd_conf, &socket);
-            Some(socket) // 保存 socket 供后续使用   
+            Some(socket) // 保存 socket 供后续使用
         }
         Err(e) => {
             log_message(&format!("Failed to create ICMPv6 socket:  {}", e), is_prod);
@@ -619,7 +621,7 @@ fn main() {
 
     loop {
         if let Some(icmp_socket) = &icmp_socket_option {
-             radvd::process_radvd_socket(&mut radvd_conf, &icmp_socket, &mut recv_buf)
+            radvd::process_radvd_socket(&mut radvd_conf, &icmp_socket, &mut recv_buf)
         }
 
         let now = Instant::now();
@@ -952,8 +954,19 @@ fn main() {
             }
             last_dns_config_check = now;
         }
-    
-         // 睡眠1秒后继续检查，避免忙等待
+
+        if now.duration_since(last_radvdprefix_check)
+            >= Duration::from_secs(RADVD_PREFIX_CHECK_INTERVAL)
+        {
+            let new_pfx = radvd::get_radvd_prefix();
+            match radvd::update_radvd_prefix(&mut radvd_conf, &new_pfx) {
+                Ok(()) => {},
+                Err(e) => log_message(&format!("radvd pfx update failed : {:?}", e), is_prod),
+            }
+            last_radvdprefix_check = now;
+        }
+
+        // 睡眠1秒后继续检查，避免忙等待
         thread::sleep(Duration::from_millis(2000));
     }
 }
