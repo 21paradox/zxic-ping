@@ -3,7 +3,6 @@
 use crate::config::{AdvDnssl, AdvPrefix, AdvRdnss, AdvRoute, Interface};
 use crate::constants::*;
 use crate::error::{RadvdError, RadvdResult};
-use crate::types::*;
 use crate::util::*;
 use std::net::Ipv6Addr;
 use std::os::fd::AsRawFd;
@@ -72,8 +71,6 @@ pub fn find_iface_by_name_mut<'a>(ifaces: &'a mut [Interface], name: &str) -> Op
 
 /// Find interface that needs to send RA next
 pub fn find_iface_by_time(ifaces: &[Interface]) -> Option<&Interface> {
-    let now = std::time::SystemTime::now();
-    
     let mut earliest_iface: Option<&Interface> = None;
     let mut earliest_time: Option<std::time::SystemTime> = None;
     
@@ -100,7 +97,7 @@ where
 }
 
 /// Set up interface for router advertisements
-pub fn setup_iface(sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) -> RadvdResult<()> {
+pub fn setup_iface(_sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) -> RadvdResult<()> {
     // Check if interface is ready
     check_iface(iface)?;
     
@@ -118,7 +115,7 @@ pub fn setup_iface(sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) ->
 }
 
 /// Clean up interface
-pub fn cleanup_iface(sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) -> RadvdResult<()> {
+pub fn cleanup_iface(_sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) -> RadvdResult<()> {
     if iface.remove_adv_on_exit && iface.state.ready {
         // Send final RA with zero lifetimes
         iface.state.cease_adv = true;
@@ -133,8 +130,6 @@ pub fn cleanup_iface(sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) 
 /// Get interface index by name (Linux)
 #[cfg(target_os = "linux")]
 pub fn get_iface_index(name: &str) -> RadvdResult<u32> {
-    use std::os::unix::io::RawFd;
-    
     let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)
         .map_err(|e| RadvdError::interface(format!("Failed to create socket: {}", e)))?;
     
@@ -165,7 +160,7 @@ pub fn get_iface_index(name: &str) -> RadvdResult<u32> {
 }
 
 /// Get interface link-local address
-pub fn get_iface_link_local_addr(name: &str) -> RadvdResult<Ipv6Addr> {
+pub fn get_iface_link_local_addr(_name: &str) -> RadvdResult<Ipv6Addr> {
     use std::net::UdpSocket;
     
     // Connect to a link-local destination to get our link-local address
@@ -233,8 +228,6 @@ pub fn iface_exists(name: &str) -> bool {
 /// Get interface hardware address
 #[cfg(target_os = "linux")]
 pub fn get_iface_hwaddr(name: &str) -> RadvdResult<(Vec<u8>, i32)> {
-    use std::os::unix::io::RawFd;
-    
     let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)
         .map_err(|e| RadvdError::interface(format!("Failed to create socket: {}", e)))?;
     
@@ -269,20 +262,16 @@ pub fn get_iface_hwaddr(name: &str) -> RadvdResult<(Vec<u8>, i32)> {
         _ => 0,
     };
     
-    let addr_bytes: Vec<u8> = unsafe {
-        hwaddr.sa_data.iter()
+    let addr_bytes: Vec<u8> = hwaddr.sa_data.iter()
             .take(addr_len as usize)
             .map(|&b| b as u8)
-            .collect()
-    };
+            .collect();
     
     Ok((addr_bytes, addr_len))
 }
 
 /// Get interface MTU
 pub fn get_iface_mtu(name: &str) -> RadvdResult<u32> {
-    use std::os::unix::io::RawFd;
-    
     let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)
         .map_err(|e| RadvdError::interface(format!("Failed to create socket: {}", e)))?;
     
@@ -319,7 +308,7 @@ pub fn update_device_index(iface: &mut Interface) -> RadvdResult<()> {
 }
 
 /// Update interface device information
-pub fn update_device_info(sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) -> RadvdResult<()> {
+pub fn update_device_info(_sock: &crate::socket::IcmpV6Socket, iface: &mut Interface) -> RadvdResult<()> {
     // Update index
     update_device_index(iface)?;
     

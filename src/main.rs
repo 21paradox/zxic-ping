@@ -1,10 +1,10 @@
-use radvd_core::socket::{open_icmpv6_socket, IcmpV6Socket};
+use radvd_core::socket::open_icmpv6_socket;
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::fs::{self};
+use std::io::{self, Read, Write};
 use std::net::UdpSocket;
-use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::io::AsRawFd;
+use std::net::{SocketAddr, TcpListener};
+// use std::os::unix::io::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -18,13 +18,8 @@ mod radvd; // 声明模块
 
 const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
-const DAY_INTERVAL: u64 = 86400; // 网络检查间隔60秒
 const SNAT_CHECK_INTERVAL: u64 = 300; // CPU检查间隔30秒
 const DNS_CONFIG_CHECK_INTERVAL: u64 = 300; // DNS配置检查间隔120秒
-const USB_HEALTH_CHECK_INTERVAL: u64 = 10; // USB健康检查间隔10秒
-const USB_WARNING_THRESHOLD: u32 = 3; // USB警告阈值
-const USB_CRITICAL_THRESHOLD: u32 = 2; // USB危险阈值
-const MEMORY_CHECK_INTERVAL: u64 = 10; // 内存检查间隔10秒
 const RADVD_PREFIX_CHECK_INTERVAL: u64 = 120; // CPU检查间隔30秒
 
 const MEMORY_LOW_THRESHOLD_KB: u64 = 1800; // 内存临界阈值2MB（小于此值杀进程）
@@ -57,8 +52,6 @@ const RESTART_SIGNAL_SERVER: &[u8] = b"RESTART_SERVER";
 const RESTART_SIGNAL_GOAHEAD: &[u8] = b"RESTART_GOAHEAD";
 const REDUCE_KERNEL_LOAD: &[u8] = b"REDUCE_KERNEL_LOAD";
 const SIGNAL_PING: &[u8] = b"PING";
-const ENABLE_KMSG_MONITOR: &[u8] = b"ENABLE_KMSG_MONITOR";
-const DISABLE_KMSG_MONITOR: &[u8] = b"DISABLE_KMSG_MONITOR";
 const ENABLE_MEMORY_MONITOR: &[u8] = b"ENABLE_MEMORY_MONITOR";
 const DISABLE_MEMORY_MONITOR: &[u8] = b"DISABLE_MEMORY_MONITOR";
 const KILL_SIGNAL_RADVD: &[u8] = b"KILL_RADVD";
@@ -68,24 +61,6 @@ const ADJUST_ZRAM: &[u8] = b"ADJUST_ZRAM";
 
 // 内存监控配置
 const MEMORY_MONITOR_INTERVAL: Duration = Duration::from_secs(6); // 内存检查间隔10秒
-
-// KMSG 监控配置
-const KMSG_CHECK_INTERVAL: Duration = Duration::from_millis(1000); // KMSG检查间隔100ms
-const KMSG_PANIC_KEYWORDS: &[&str] = &[
-    "error",
-    "overflow",
-    "panic",
-    "hung",
-    "fault",
-    "unable",
-    "memory",
-    "Call Trace",
-    "overflow",
-    "corrupted",
-    "warn",
-    "lock",
-    "blocked",
-];
 
 // echo -n "REDUCE_KERNEL_LOAD" | nc <TARGETIP> 1300
 
@@ -150,7 +125,7 @@ fn handle_restart_goahead(target_ip: &str, is_prod: bool) {
 
 fn handle_reduce_kernel_load(target_ip: &str, is_prod: bool) {
     let mut zte_count = 0;
-    let mut high_prio_count = 0;
+    let high_prio_count = 0;
     let mut cpu_hog_count = 0;
 
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -273,7 +248,7 @@ fn handle_kill_goahead(target_ip: &str, is_prod: bool) {
 }
 
 fn handle_kill_radvd(target_ip: &str, is_prod: bool) {
-    force_kill_process(is_prod, "dhcp6s");
+    let _ = force_kill_process(is_prod, "dhcp6s");
     match force_kill_process(is_prod, "radvd") {
         Ok(_) => {
             log_message("✅ radvd killed successfully", is_prod);
@@ -287,9 +262,9 @@ fn handle_kill_radvd(target_ip: &str, is_prod: bool) {
 
 fn handle_restart_radvd(target_ip: &str, is_prod: bool) {
     let _ = force_kill_process(is_prod, "radvd");
-    force_kill_process(is_prod, "dhcp6s");
+    let _ = force_kill_process(is_prod, "dhcp6s");
     thread::sleep(Duration::from_secs(1));
-    force_restart_radvd_process(target_ip.clone(), is_prod);
+    force_restart_radvd_process(target_ip, is_prod);
 }
 
 fn handle_adjust_zram(target_ip: &str, is_prod: bool) {
@@ -419,125 +394,12 @@ impl MemoryMonitor {
                     // 额外清理 page cache
                     let _ = std::fs::write("/proc/sys/vm/drop_caches", b"1\n");
                     thread::sleep(Duration::from_secs(10));
-                    force_restart_radvd_process(target_ip.clone(), is_prod);
+                    force_restart_radvd_process(target_ip, is_prod);
                 }
             }
         } else {
             log_message("Failed to get memory info via sysinfo", is_prod);
         }
-    }
-}
-
-/// KMSG 监控状态 - 极简内存设计，无线程
-struct KmsgMonitor {
-    enabled: AtomicBool,
-    reader: Option<BufReader<File>>,
-    last_warning_time: Option<Instant>,
-}
-
-impl KmsgMonitor {
-    fn new() -> Self {
-        KmsgMonitor {
-            enabled: AtomicBool::new(false),
-            reader: None,
-            last_warning_time: None,
-        }
-    }
-
-    fn enable(&mut self, is_prod: bool) {
-        if !self.enabled.load(Ordering::Relaxed) {
-            // 尝试打开 /proc/kmsg
-            match File::open("/proc/kmsg") {
-                Ok(file) => {
-                    // 设置为非阻塞模式
-                    unsafe {
-                        let fd = file.as_raw_fd();
-                        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-                        if flags >= 0 {
-                            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                        }
-                    }
-                    self.reader = Some(BufReader::new(file));
-                    self.enabled.store(true, Ordering::Relaxed);
-                    log_message("KMSG monitor enabled", is_prod);
-                }
-                Err(e) => {
-                    log_message(&format!("Failed to open /proc/kmsg: {}", e), is_prod);
-                }
-            }
-        }
-    }
-
-    fn disable(&mut self, is_prod: bool) {
-        if self.enabled.load(Ordering::Relaxed) {
-            self.enabled.store(false, Ordering::Relaxed);
-            self.reader = None;
-            log_message("KMSG monitor disabled", is_prod);
-        }
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
-    }
-
-    /// 在主循环中调用，检查 KMSG
-    fn check(&mut self, target_ip: &str, is_prod: bool) {
-        if !self.is_enabled() {
-            return;
-        }
-
-        const WARNING_COOLDOWN: Duration = Duration::from_secs(5);
-        let reader = match &mut self.reader {
-            Some(r) => r,
-            None => return,
-        };
-
-        // 尽可能多地读取行（非阻塞）
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break, // 没有更多数据
-                Ok(_) => {
-                    // 检查是否包含崩溃关键词
-                    if let Some(keyword) = Self::check_panic_keywords(&line) {
-                        let now = Instant::now();
-                        let should_warn = match self.last_warning_time {
-                            Some(t) if now.duration_since(t) >= WARNING_COOLDOWN => true,
-                            None => true,
-                            _ => false,
-                        };
-
-                        if should_warn {
-                            let warning_msg = format!(
-                                "KERNEL_WARNING: detected '{}' in kmsg: {}",
-                                keyword,
-                                line.trim().chars().take(200).collect::<String>()
-                            );
-                            log_message(&warning_msg, is_prod);
-                            send_udp_notification(&warning_msg, target_ip.to_string(), is_prod);
-                            self.last_warning_time = Some(now);
-                        }
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        break; // 没有更多数据可读
-                    }
-                    // 其他错误，记录但不影响主循环
-                    break;
-                }
-            }
-        }
-    }
-
-    /// 检查行中是否包含崩溃关键词
-    fn check_panic_keywords(line: &str) -> Option<&str> {
-        for keyword in KMSG_PANIC_KEYWORDS {
-            if line.contains(keyword) {
-                return Some(keyword);
-            }
-        }
-        None
     }
 }
 
@@ -574,9 +436,6 @@ fn main() {
         is_prod,
     );
 
-    // 创建 KMSG 监控器（极简设计，无线程）
-    let mut kmsg_monitor = KmsgMonitor::new();
-
     // 创建内存监控器（极简设计，无线程）
     let mut memory_monitor = MemoryMonitor::new();
 
@@ -599,9 +458,9 @@ fn main() {
 
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
-    force_kill_process(is_prod, "dnsmasq");
-    force_kill_process(is_prod, "dhcp6s");
-    force_kill_process(is_prod, "radvd");
+    let _ = force_kill_process(is_prod, "dnsmasq");
+    let _ = force_kill_process(is_prod, "dhcp6s");
+    let _ = force_kill_process(is_prod, "radvd");
 
     let radvd_pfx = radvd::get_radvd_prefix();
     log_message(&format!("radvd_pfx:  {}", radvd_pfx), is_prod);
@@ -625,13 +484,12 @@ fn main() {
         }
 
         let now = Instant::now();
-        let mut buf = [0u8; 64];
         // 处理 TCP 连接
         match signal_listener.accept() {
             // Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
             //     // 非阻塞，没有新连接
             // }
-            Err(e) => {
+            Err(_e) => {
                 // if !is_prod {
                 //     log_message(&format!("❌ Signal listener error: {}", e), is_prod);
                 // }
@@ -680,30 +538,6 @@ fn main() {
                                 is_prod,
                             );
                             handle_reduce_kernel_load(&target_ip, is_prod);
-                            let _ = stream.write_all(b"OK");
-                        } else if received == ENABLE_KMSG_MONITOR {
-                            log_message(
-                                &format!("📨 Received enable kmsg monitor signal from {}", addr),
-                                is_prod,
-                            );
-                            kmsg_monitor.enable(is_prod);
-                            send_udp_notification(
-                                "KMSG_MONITOR_ENABLED",
-                                target_ip.clone(),
-                                is_prod,
-                            );
-                            let _ = stream.write_all(b"OK");
-                        } else if received == DISABLE_KMSG_MONITOR {
-                            log_message(
-                                &format!("📨 Received disable kmsg monitor signal from {}", addr),
-                                is_prod,
-                            );
-                            kmsg_monitor.disable(is_prod);
-                            send_udp_notification(
-                                "KMSG_MONITOR_DISABLED",
-                                target_ip.clone(),
-                                is_prod,
-                            );
                             let _ = stream.write_all(b"OK");
                         } else if received == ENABLE_MEMORY_MONITOR {
                             log_message(
@@ -860,15 +694,15 @@ fn main() {
                                 ),
                                 is_prod,
                             );
-                            force_kill_process(is_prod, "adbd");
-                            force_kill_process(is_prod, "goahead");
+                            let _ = force_kill_process(is_prod, "adbd");
+                            let _ = force_kill_process(is_prod, "goahead");
                             throttle_network_parameters(is_prod);
                         }
                     } else {
                         if high_latency_count >= MAX_HIGH_LATENCY {
                             if connect_duration.as_millis() < HIGH_LATENCY_THRESHOLD_MIN {
                                 restore_network_parameters(is_prod);
-                                force_start_goahead_process(is_prod);
+                                let _ = force_start_goahead_process(is_prod);
                                 clear_page_cache(is_prod);
                                 high_latency_count = 1
                             } else {
@@ -960,7 +794,7 @@ fn main() {
         {
             let new_pfx = radvd::get_radvd_prefix();
             match radvd::update_radvd_prefix(&mut radvd_conf, &new_pfx) {
-                Ok(()) => {},
+                Ok(()) => {}
                 Err(e) => log_message(&format!("radvd pfx update failed : {:?}", e), is_prod),
             }
             last_radvdprefix_check = now;
@@ -997,7 +831,7 @@ impl ProcessPriority {
     }
 }
 
-fn reset_android_usb(is_prod: bool) {
+fn reset_android_usb(_is_prod: bool) {
     let _ = std::fs::write("/sys/class/android_usb/android0/enable", b"0\n");
     let _ = std::fs::write("/sys/class/android_usb/android0/enable", b"1\n");
 }
@@ -1249,7 +1083,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
     }
 }
 
-fn clear_page_cache(is_prod: bool) {
+fn clear_page_cache(_is_prod: bool) {
     let _ = std::fs::write("/proc/sys/vm/drop_caches", b"1\n");
 }
 
@@ -1313,10 +1147,10 @@ fn tcp_connect_check(target_ip: &str, is_prod: bool) -> bool {
     match TcpStream::connect_timeout(&target_ip.parse().unwrap(), CONNECT_TIMEOUT) {
         Ok(stream) => {
             drop(stream);
-            let duration = start.elapsed();
-            if !is_prod {
-                // log_message(&format!("TCP connect successful, took {:?}", duration.as_millis()), is_prod);
-            }
+            // let _duration = start.elapsed();
+            // if !is_prod {
+            //     // log_message(&format!("TCP connect successful, took {:?}", duration.as_millis()), is_prod);
+            // }
             true
         }
         Err(e) => {
@@ -1410,7 +1244,7 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
     thread::sleep(Duration::from_secs(3));
 
     // 3. 启动新的adbd进程
-    let mut child = Command::new("/bin/adbd")
+    let child = Command::new("/bin/adbd")
         .stdout(Stdio::null()) // 标准输出重定向到 /dev/null
         .stderr(Stdio::null()) // 标准错误重定向到 /dev/null
         .spawn()
@@ -1432,7 +1266,7 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
     }
 
     log_message("adbd force restarted successfully", is_prod);
-    re_enable_adb_function(is_prod);
+    let _ = re_enable_adb_function(is_prod);
     Ok(())
 }
 
@@ -1453,7 +1287,7 @@ fn force_restart_radvd_process(target_ip: &str, is_prod: bool) {
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(mut child) => {
+        Ok(child) => {
             let parent_pid = child.id();
             log_message(
                 &format!(
@@ -1509,7 +1343,7 @@ pub fn force_start_goahead_process(is_prod: bool) -> Result<(), String> {
     log_message("Force restart goahead process...", is_prod);
 
     // 启动进程
-    let mut child = Command::new("/bin/goahead")
+    let child = Command::new("/bin/goahead")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

@@ -1,18 +1,14 @@
-use radvd_core::config::{AdvPrefix, AdvRdnss, Config, Interface};
-use radvd_core::types::RouterPreference;
-
+use radvd_core::config::{AdvPrefix, Config, Interface};
 use std::net::Ipv6Addr;
-use std::path::PathBuf;
 
 use radvd_core::constants::{MAX_INITIAL_RTR_ADVERTISEMENTS, MAX_INITIAL_RTR_ADV_INTERVAL};
 use radvd_core::interface::{self, update_device_info};
-use radvd_core::parser::parse_config;
 use radvd_core::ra::send_ra_forall;
-use radvd_core::socket::{open_icmpv6_socket, IcmpV6Socket};
+use radvd_core::socket::IcmpV6Socket;
 use radvd_core::timer::{expired, reschedule_iface, touch_iface};
 use radvd_core::util::rand_between;
 
-pub fn create_radvd_config(prefixAddr: &str) -> Config {
+pub fn create_radvd_config(prefix_addr: &str) -> Config {
     use radvd_core::config::Interface;
 
     let mut iface = Interface::default();
@@ -24,7 +20,7 @@ pub fn create_radvd_config(prefixAddr: &str) -> Config {
 
     // 添加 prefix
     let mut prefix = AdvPrefix::default();
-    prefix.prefix = prefixAddr.parse().unwrap();
+    prefix.prefix = prefix_addr.parse().unwrap();
     prefix.prefix_len = 64;
     prefix.adv_on_link_flag = true;
     prefix.adv_autonomous_flag = true;
@@ -51,7 +47,6 @@ pub fn update_radvd_prefix(conf: &mut Config, new_prefix: &str) -> Result<(), St
 }
 
 pub fn get_radvd_prefix() -> String {
-    use regex::Regex;
     use std::process::Command;
     use std::str;
 
@@ -77,24 +72,25 @@ pub fn get_radvd_prefix() -> String {
     {
         if output.status.success() {
             if let Ok(output_str) = str::from_utf8(&output.stdout) {
-                // 正则匹配全局 IPv6 地址
-                let re = Regex::new(r"inet6\s+([0-9a-f:]+)/\d+").unwrap();
+                // 查找 inet6 地址行
+                for line in output_str.lines() {
+                    if let Some(pos) = line.find("inet6 ") {
+                        let after = &line[pos + 6..];
+                        let end = after
+                            .find(|c: char| c == ' ' || c == '/')
+                            .unwrap_or(after.len());
+                        let addr = &after[..end];
 
-                for cap in re.captures_iter(output_str) {
-                    let addr = &cap[1];
+                        // 跳过链路本地地址
+                        if addr.starts_with("fe80") {
+                            continue;
+                        }
 
-                    // 跳过链路本地地址
-                    if addr.starts_with("fe80") {
-                        continue;
-                    }
-
-                    // 提取前4段
-                    let segments: Vec<&str> = addr.split(':').collect();
-                    if segments.len() >= 4 {
-                        return format!(
-                            "{}:{}:{}:{}::",
-                            segments[0], segments[1], segments[2], segments[3]
-                        );
+                        // 提取前4段
+                        let segs: Vec<&str> = addr.split(':').collect();
+                        if segs.len() >= 4 {
+                            return format!("{}:{}:{}:{}::", segs[0], segs[1], segs[2], segs[3]);
+                        }
                     }
                 }
             }

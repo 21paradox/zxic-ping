@@ -2,16 +2,14 @@
 
 use crate::config::*;
 use crate::constants::*;
-use crate::error::{RadvdError, RadvdResult};
+use crate::error::RadvdResult;
 use crate::types::*;
 use crate::util::*;
 use std::net::{Ipv6Addr, SocketAddrV6};
 
 // ND option types
 const ND_OPT_SOURCE_LINK_LAYER_ADDRESS: u8 = 1;
-const ND_OPT_TARGET_LINK_LAYER_ADDRESS: u8 = 2;
 const ND_OPT_PREFIX_INFORMATION: u8 = 3;
-const ND_OPT_REDIRECTED_HEADER: u8 = 4;
 const ND_OPT_MTU: u8 = 5;
 
 /// Router Advertisement packet header (ICMPv6)
@@ -437,7 +435,7 @@ impl HomeAgentInfoOption {
 
 /// Build a complete Router Advertisement packet
 /// 选项顺序与 C 代码 radvd 保持一致
-pub fn build_ra_packet(iface: &Interface, dest: Option<&Ipv6Addr>, cease: bool) -> RadvdResult<Vec<u8>> {
+pub fn build_ra_packet(iface: &Interface, _dest: Option<&Ipv6Addr>, cease: bool) -> RadvdResult<Vec<u8>> {
     let mut packet = SafeBuffer::with_capacity(MSG_SIZE_SEND);
     
     // Add RA header
@@ -517,7 +515,7 @@ pub fn send_ra(
     };
     
     // Get source address (link-local or specified RA source)
-    let src_addr = iface.props.if_addr_rasrc.unwrap_or(iface.props.if_addr);
+    let _src_addr = iface.props.if_addr_rasrc.unwrap_or(iface.props.if_addr);
     
     // Create socket address with interface scope
     let sock_addr = SocketAddrV6::new(dest_addr, 0, 0, iface.props.if_index);

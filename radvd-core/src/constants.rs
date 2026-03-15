@@ -3,7 +3,7 @@
 //! These constants are based on RFC 4861 (Neighbor Discovery for IPv6),
 //! RFC 4862 (IPv6 Stateless Address Autoconfiguration), and related standards.
 
-use std::time::Duration;
+
 
 /// Maximum message size for incoming and outgoing RSs and RAs
 pub const MSG_SIZE_RECV: usize = 1500;

@@ -1,7 +1,7 @@
 //! Type definitions for radvd
 
 use std::net::Ipv6Addr;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// Hardware address (MAC address)
 pub type HwAddr = [u8; crate::constants::HWADDR_MAX];

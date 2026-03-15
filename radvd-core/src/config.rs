@@ -3,7 +3,6 @@
 use crate::constants::*;
 use crate::types::*;
 use std::net::Ipv6Addr;
-use std::time::Duration;
 
 /// Complete radvd configuration
 #[derive(Debug, Clone, Default)]

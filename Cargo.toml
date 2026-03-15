@@ -9,7 +9,6 @@ libc = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
 # Local crate
 radvd-core = { path = "radvd-core" }
-regex = "1"
 
 
 [workspace]

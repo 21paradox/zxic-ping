@@ -1,9 +1,8 @@
 //! ICMPv6 socket handling for radvd
 
 use crate::error::{RadvdError, RadvdResult};
-use crate::constants::*;
 use std::net::{Ipv6Addr, SocketAddrV6};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 
 /// ICMPv6 socket wrapper
 pub struct IcmpV6Socket {

@@ -193,7 +193,6 @@ pub fn addr_in_prefix(addr: &Ipv6Addr, prefix: &Ipv6Addr, prefix_len: u8) -> boo
 /// Read exactly n bytes from a file descriptor
 #[cfg(unix)]
 pub fn readn(fd: i32, buf: &mut [u8], count: usize) -> std::io::Result<usize> {
-    use std::os::unix::io::RawFd;
     use libc;
     
     let mut total_read = 0;
