@@ -21,10 +21,18 @@ const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
 const SNAT_CHECK_INTERVAL: u64 = 300; // CPU检查间隔30秒
 const DNS_CONFIG_CHECK_INTERVAL: u64 = 300; // DNS配置检查间隔120秒
 const RADVD_PREFIX_CHECK_INTERVAL: u64 = 120; // CPU检查间隔30秒
+const SNTP_SYNC_INTERVAL: u64 = 3600; // SNTP同步间隔1小时
+const SNTP_TIMEOUT: Duration = Duration::from_secs(5); // SNTP超时时间
+const SNTP_SERVERS: &[&str] = &[
+    // 域名作为后备（当DNS可用时）
+    "ntp.aliyun.com:123",
+    "time.windows.com:123",
+    "cn.pool.ntp.org:123",
+]; // SNTP服务器列表（IP优先，避免DNS依赖）
 
-const MEMORY_LOW_THRESHOLD_KB: u64 = 1800; // 内存临界阈值2MB（小于此值杀进程）
-const MEMORY_CRITICAL_THRESHOLD_KB: u64 = 2400; // 内存临界阈值2MB（小于此值杀进程）
-                                                // const ADBD_CHECK_INTERVAL: u64 = 60; // adbd检查间隔10秒
+const MEMORY_LOW_THRESHOLD_KB: u64 = 2000; // 内存临界阈值2MB（小于此值杀进程）
+const MEMORY_CRITICAL_THRESHOLD_KB: u64 = 1600; // 内存临界阈值1600KB（小于此值杀进程）
+
 const WARN_FAILURES: u32 = 10;
 const MAX_FAILURES: u32 = 15;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -56,8 +64,9 @@ const ENABLE_MEMORY_MONITOR: &[u8] = b"ENABLE_MEMORY_MONITOR";
 const DISABLE_MEMORY_MONITOR: &[u8] = b"DISABLE_MEMORY_MONITOR";
 const KILL_SIGNAL_RADVD: &[u8] = b"KILL_RADVD";
 const KILL_SIGNAL_GOAHEAD: &[u8] = b"KILL_GOAHEAD";
-const RESTART_SIGNAL_RADVD: &[u8] = b"RESTART_RADVD";
 const ADJUST_ZRAM: &[u8] = b"ADJUST_ZRAM";
+const USB_FUNCTIONS: &[u8] = b"USB_FUNCTIONS";
+const WAN_IP_ADDR: &[u8] = b"WAN_IP_ADDR";
 
 // 内存监控配置
 const MEMORY_MONITOR_INTERVAL: Duration = Duration::from_secs(6); // 内存检查间隔10秒
@@ -260,13 +269,6 @@ fn handle_kill_radvd(target_ip: &str, is_prod: bool) {
     }
 }
 
-fn handle_restart_radvd(target_ip: &str, is_prod: bool) {
-    let _ = force_kill_process(is_prod, "radvd");
-    let _ = force_kill_process(is_prod, "dhcp6s");
-    thread::sleep(Duration::from_secs(1));
-    force_restart_radvd_process(target_ip, is_prod);
-}
-
 fn handle_adjust_zram(target_ip: &str, is_prod: bool) {
     log_message("Adjusting zram configuration...", is_prod);
 
@@ -359,42 +361,17 @@ impl MemoryMonitor {
                     is_prod,
                 );
 
+                let _ = force_kill_process(is_prod, "dnsmasq");
                 let _ = force_kill_process(is_prod, "dhcp6s");
-                // 杀掉 goahead
-                match force_kill_process(is_prod, "goahead") {
-                    Ok(_) => {
-                        log_message("✅ goahead killed due to low memory", is_prod);
-                        send_udp_notification(
-                            "LOW_MEMORY_KILLED_GOAHEAD",
-                            target_ip.to_string(),
-                            is_prod,
-                        );
-                    }
-                    Err(e) => {
-                        log_message(&format!("❌ Failed to kill goahead: {}", e), is_prod);
-                    }
-                }
+                let _ = force_kill_process(is_prod, "radvd");
+                let _ = force_kill_process(is_prod, "adbd");
                 let _ = std::fs::write("/proc/sys/vm/compact_memory", b"1\n");
 
                 if free_kb < MEMORY_CRITICAL_THRESHOLD_KB {
-                    let _ = force_kill_process(is_prod, "radvd");
-                    match force_kill_process(is_prod, "adbd") {
-                        Ok(_) => {
-                            log_message("✅ adbd killed due to low memory", is_prod);
-                            send_udp_notification(
-                                "LOW_MEMORY_KILLED_ADBD",
-                                target_ip.to_string(),
-                                is_prod,
-                            );
-                        }
-                        Err(e) => {
-                            log_message(&format!("❌ Failed to kill adbd: {}", e), is_prod);
-                        }
-                    }
+                    let _ = force_kill_process(is_prod, "goahead");
                     // 额外清理 page cache
                     let _ = std::fs::write("/proc/sys/vm/drop_caches", b"1\n");
                     thread::sleep(Duration::from_secs(10));
-                    force_restart_radvd_process(target_ip, is_prod);
                 }
             }
         } else {
@@ -403,7 +380,26 @@ impl MemoryMonitor {
     }
 }
 
+// use signal_hook::{
+//     consts::SIGTERM,
+//     iterator::{exfiltrator::WithOrigin, SignalsInfo},  // 引入 WithOrigin
+// };
+// use std::sync::Arc;
+
+// fn set_process_name(name: &str) {
+//     // 设置 /proc/[pid]/comm 显示的短名称 (用于 top, htop)
+//     let c_name = std::ffi::CString::new(name).unwrap();
+//     unsafe {
+//         libc::prctl(libc::PR_SET_NAME, c_name.as_ptr(), 0, 0, 0);
+//     }
+//     // 设置 ps -ef 显示的完整命令行 (argv[0])
+//     proctitle::set_title(name);
+// }
+
 fn main() {
+    // 设置进程名
+    // set_process_name("ztedm_timer");
+
     let args: Vec<String> = env::args().collect();
 
     // 检查是否需要后台运行
@@ -411,9 +407,43 @@ fn main() {
     if args.iter().any(|arg| arg == "--isprod") {
         is_prod = true;
     }
+
     if args.iter().any(|arg| arg == "--background" || arg == "-b") {
         daemonize_simple(is_prod);
     }
+
+    // let running = Arc::new(AtomicBool::new(true));
+    // let r = running.clone();
+
+    // let mut signals = SignalsInfo::<WithOrigin>::new(&[SIGTERM]).unwrap();
+
+    // thread::spawn(move || {
+    //     for info in signals.forever() {
+    //         // 现在可以获取发送者 PID
+    //         match &info.process {
+    //             Some(process) => {
+    //                 let pid = process.pid;
+    //                 // 尝试读取发送者命令名
+    //                 let cmd = fs::read_to_string(format!("/proc/{}/comm", pid))
+    //                     .map(|s| s.trim().to_string())
+    //                     .unwrap_or_else(|_| "unknown".to_string());
+
+    //                 eprintln!("Received SIGTERM from PID {} ({})", pid, cmd);
+    //             }
+    //             None => eprintln!("Received SIGTERM from Kernel/System"),
+    //         }
+
+    //         r.store(false, Ordering::SeqCst);
+    //         break;
+    //     }
+    // });
+    // while running.load(Ordering::SeqCst) {
+    //     // 你的主循环
+    //     std::thread::sleep(std::time::Duration::from_secs(1));
+    // }
+
+    // eprintln!("Shutting down gracefully...");
+    // return;
 
     let target_ip = get_target_ip();
 
@@ -454,7 +484,11 @@ fn main() {
     // let mut last_adbd_check = Instant::now();
     // let mut last_log_prune = Instant::now();
     let mut last_dns_config_check = Instant::now();
-    let mut last_radvdprefix_check = Instant::now();
+    // 初始化为很早以前的时间，确保第一次 loop 就执行 radvd prefix 检查
+    let mut last_radvdprefix_check =
+        Instant::now() - Duration::from_secs(RADVD_PREFIX_CHECK_INTERVAL + 1);
+    // SNTP同步时间检查
+    let mut last_sntp_check = Instant::now() - Duration::from_secs(SNTP_SYNC_INTERVAL + 1);
 
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
@@ -462,14 +496,93 @@ fn main() {
     let _ = force_kill_process(is_prod, "dhcp6s");
     let _ = force_kill_process(is_prod, "radvd");
 
-    let radvd_pfx = radvd::get_radvd_prefix();
-    log_message(&format!("radvd_pfx:  {}", radvd_pfx), is_prod);
-    let mut radvd_conf = radvd::create_radvd_config(&radvd_pfx);
+    // 检查 /etc/resolv.conf，如果为空或最后一行是 nameserver 127.0.0.1，则追加 DNS
+    match fs::read_to_string("/etc/resolv.conf") {
+        Ok(content) => {
+            let trimmed = content.trim();
+            let last_line = trimmed.lines().last().unwrap_or("").trim();
+            if trimmed.is_empty() || last_line == "nameserver 127.0.0.1" {
+                log_message("Adding fallback DNS 223.5.5.5 to /etc/resolv.conf", is_prod);
+                let _ = fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open("/etc/resolv.conf")
+                    .and_then(|mut f| {
+                        if !trimmed.is_empty() && !trimmed.ends_with('\n') {
+                            f.write_all(b"\n")?;
+                        }
+                        f.write_all(b"nameserver 223.5.5.5\n")
+                    });
+            }
+        }
+        Err(_) => {
+            // 文件不存在或无法读取，尝试创建
+            let _ = fs::write("/etc/resolv.conf", b"nameserver 223.5.5.5\n");
+        }
+    }
+
+    // 检测 nv get LanEnable 和 nv get need_jilian，如果都返回0则配置网桥
+    let lan_enable = match Command::new("nv").arg("get").arg("LanEnable").output() {
+        Ok(output) => {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            } else {
+                String::new()
+            }
+        }
+        Err(_) => String::new(),
+    };
+    let need_jilian = match Command::new("nv").arg("get").arg("need_jilian").output() {
+        Ok(output) => {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            } else {
+                String::new()
+            }
+        }
+        Err(_) => String::new(),
+    };
+    if lan_enable == "0" && need_jilian == "0" {
+        log_message("LanEnable=0 and need_jilian=0, configuring bridge...", is_prod);
+        let _ = Command::new("brctl").args(["addbr", "br0"]).status();
+        let _ = Command::new("brctl").args(["stp", "br0", "off"]).status();
+        let _ = Command::new("brctl").args(["addif", "br0", "wan1"]).status();
+        let _ = Command::new("brctl").args(["addif", "br0", "usblan0"]).status();
+        let _ = Command::new("ifconfig").args(["br0", "up"]).status();
+        let _ = Command::new("ifconfig").args(["usblan0", "up"]).status();
+
+        // 获取 IPv6 前缀并配置 br0
+        let wan1_ipv6_prefix = match Command::new("nv").arg("get").arg("wan1_ipv6_prefix_info").output() {
+            Ok(output) => {
+                if output.status.success() {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    String::new()
+                }
+            }
+            Err(_) => String::new(),
+        };
+        if !wan1_ipv6_prefix.is_empty() {
+            let ipv6_addr = format!("{}:2/64", wan1_ipv6_prefix);
+            log_message(&format!("Adding IPv6 address {} to br0", ipv6_addr), is_prod);
+            let _ = Command::new("ip").args(["addr", "add", &ipv6_addr, "dev", "br0"]).status();
+        }
+
+        // 根据 target_sock_ip 计算 br0 的 IP 地址（将最后一位改为1）
+        if let Some(last_dot) = target_sock_ip.rfind('.') {
+            let base_ip = &target_sock_ip[..last_dot + 1];
+            let br0_ip = format!("{}1", base_ip);
+            log_message(&format!("Adding IPv4 address {}/24 to br0", br0_ip), is_prod);
+            let _ = Command::new("ip")
+                .args(["addr", "add", &format!("{}/24", br0_ip), "dev", "br0"])
+                .status();
+        }
+    }
+
     let mut recv_buf = vec![0u8; 200];
 
     let icmp_socket_option = match open_icmpv6_socket() {
         Ok(socket) => {
-            radvd::setup_radvd(&mut radvd_conf, &socket);
             Some(socket) // 保存 socket 供后续使用
         }
         Err(e) => {
@@ -477,13 +590,44 @@ fn main() {
             None
         }
     };
+    let mut radvd_conf_option = None;
 
     loop {
-        if let Some(icmp_socket) = &icmp_socket_option {
-            radvd::process_radvd_socket(&mut radvd_conf, &icmp_socket, &mut recv_buf)
+        let now = Instant::now();
+
+        if now.duration_since(last_radvdprefix_check)
+            >= Duration::from_secs(RADVD_PREFIX_CHECK_INTERVAL)
+        {
+            let new_pfx = radvd::get_radvd_prefix();
+            if !new_pfx.is_empty() {
+                match radvd_conf_option.as_mut() {
+                    Some(radvd_conf) => {
+                        // 更新现有配置
+                        if let Err(e) = radvd::update_radvd_prefix(radvd_conf, &new_pfx) {
+                            log_message(&format!("radvd pfx update failed: {:?}", e), is_prod);
+                        }
+                    }
+                    None => {
+                        // 创建新配置并初始化
+                        let mut new_conf = radvd::create_radvd_config(&new_pfx);
+                        if let Some(icmp_socket) = &icmp_socket_option {
+                            radvd::setup_radvd(&mut new_conf, icmp_socket);
+                        }
+                        radvd_conf_option = Some(new_conf);
+                    }
+                }
+            }
+
+            last_radvdprefix_check = now;
         }
 
-        let now = Instant::now();
+        // 处理 radvd socket（使用迭代器避免嵌套if let）
+        if let (Some(icmp_socket), Some(radvd_conf)) =
+            (&icmp_socket_option, radvd_conf_option.as_mut())
+        {
+            radvd::process_radvd_socket(radvd_conf, icmp_socket, &mut recv_buf);
+        }
+
         // 处理 TCP 连接
         match signal_listener.accept() {
             // Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -572,13 +716,6 @@ fn main() {
                             );
                             handle_kill_radvd(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
-                        } else if received == RESTART_SIGNAL_RADVD {
-                            log_message(
-                                &format!("📨 Received restart radvd signal from {}", addr),
-                                is_prod,
-                            );
-                            handle_restart_radvd(&target_ip, is_prod);
-                            let _ = stream.write_all(b"OK");
                         } else if received == ADJUST_ZRAM {
                             log_message(
                                 &format!("📨 Received adjust zram signal from {}", addr),
@@ -593,6 +730,26 @@ fn main() {
                             );
                             handle_kill_goahead(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
+                        } else if received == USB_FUNCTIONS {
+                            log_message(
+                                &format!("Received usb functions query from {}", addr),
+                                is_prod,
+                            );
+                            match fs::read_to_string("/sys/class/android_usb/android0/functions") {
+                                Ok(content) => {
+                                    let _ = stream.write_all(content.trim().as_bytes());
+                                }
+                                Err(_) => {
+                                    let _ = stream.write_all(b"ERROR");
+                                }
+                            }
+                        } else if received == WAN_IP_ADDR {
+                            log_message(
+                                &format!("Received get wanip query from {}", addr),
+                                is_prod,
+                            );
+                            let wan1_ip = get_wan_ip_address(is_prod);
+                            let _ = stream.write_all(wan1_ip.trim().as_bytes());
                         }
                     }
                     _ => {}
@@ -627,7 +784,7 @@ fn main() {
 
                 if needs_update {
                     let ipt_cmds = [
-                        format!("iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j SNAT --to-source {}", target_sock_ip, wan1_ip),
+                        format!("iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j NETMAP --to {}", target_sock_ip, wan1_ip),
                         "iptables -t nat -D POSTROUTING 2".to_string(),
                     ];
 
@@ -741,24 +898,24 @@ fn main() {
                         &format!("Failure count: {}/{}", failure_count, MAX_FAILURES),
                         is_prod,
                     );
-                    if failure_count == WARN_FAILURES {
-                        log_message(
-                            &format!(
-                                "Critical: {} consecutive pre failure detected",
-                                WARN_FAILURES
-                            ),
-                            is_prod,
-                        );
-                        log_message("try reset android usb...", is_prod);
-                        reset_android_usb(is_prod);
-                    } else if failure_count == MAX_FAILURES {
-                        log_message(
-                            &format!("Critical: {} consecutive failures detected", MAX_FAILURES),
-                            is_prod,
-                        );
-                        log_message("Initiating system reboot...", is_prod);
-                        reboot_system(is_prod);
-                    }
+                    // if failure_count == WARN_FAILURES {
+                    //     log_message(
+                    //         &format!(
+                    //             "Critical: {} consecutive pre failure detected",
+                    //             WARN_FAILURES
+                    //         ),
+                    //         is_prod,
+                    //     );
+                    //     log_message("try reset android usb...", is_prod);
+                    //     reset_android_usb(is_prod);
+                    // } else if failure_count == MAX_FAILURES {
+                    //     log_message(
+                    //         &format!("Critical: {} consecutive failures detected", MAX_FAILURES),
+                    //         is_prod,
+                    //     );
+                    //     log_message("Initiating system reboot...", is_prod);
+                    //     reboot_system(is_prod);
+                    // }
                 }
             }
             last_network_check = now;
@@ -774,6 +931,7 @@ fn main() {
         if now.duration_since(last_dns_config_check)
             >= Duration::from_secs(DNS_CONFIG_CHECK_INTERVAL)
         {
+            // todo use nv get wan1_ipv6_pridns_auto
             match fs::read_to_string("/etc_rw/dnsmasq.conf") {
                 Ok(content) => {
                     let msg = format!("DNS_CONF: {}", content);
@@ -789,15 +947,36 @@ fn main() {
             last_dns_config_check = now;
         }
 
-        if now.duration_since(last_radvdprefix_check)
-            >= Duration::from_secs(RADVD_PREFIX_CHECK_INTERVAL)
-        {
-            let new_pfx = radvd::get_radvd_prefix();
-            match radvd::update_radvd_prefix(&mut radvd_conf, &new_pfx) {
-                Ok(()) => {}
-                Err(e) => log_message(&format!("radvd pfx update failed : {:?}", e), is_prod),
+        // SNTP时间同步检查
+        if now.duration_since(last_sntp_check) >= Duration::from_secs(SNTP_SYNC_INTERVAL) {
+            match sntp_sync_time(is_prod) {
+                Ok((time_str, offset_secs, server_used)) => {
+                    log_message(
+                        &format!(
+                            "SNTP sync successful: {} (server: {}, offset: {}s)",
+                            time_str, server_used, offset_secs
+                        ),
+                        is_prod,
+                    );
+                    send_udp_notification(
+                        &format!(
+                            "SNTP_SYNC_OK: {} (server: {}, offset: {}s)",
+                            time_str, server_used, offset_secs
+                        ),
+                        target_ip.clone(),
+                        is_prod,
+                    );
+                }
+                Err(e) => {
+                    log_message(&format!("SNTP sync failed: {}", e), is_prod);
+                    send_udp_notification(
+                        &format!("SNTP_SYNC_FAILED: {}", e),
+                        target_ip.clone(),
+                        is_prod,
+                    );
+                }
             }
-            last_radvdprefix_check = now;
+            last_sntp_check = now;
         }
 
         // 睡眠1秒后继续检查，避免忙等待
@@ -860,6 +1039,7 @@ fn restore_network_parameters(is_prod: bool) {
         }
     }
 }
+
 fn get_wan_ip_address(is_prod: bool) -> String {
     // 方法1: 使用 ip 命令获取 wan1 接口的 IP
     if let Ok(output) = Command::new("ip").args(["addr", "show", "wan1"]).output() {
@@ -882,7 +1062,7 @@ fn get_wan_ip_address(is_prod: bool) -> String {
         }
     }
 
-    log_message("Could not determine wan1 IP address", is_prod);
+    // log_message("Could not determine wan1 IP address", is_prod);
     String::new()
 }
 
@@ -929,6 +1109,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
     let wan1_ip = get_wan_ip_address(is_prod);
 
     let commands = [
+        "echo zixc_ping > /sys/power/wake_lock", 
         "echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
         "echo 2200 > /sys/module/net_ext_modul/parameters/skb_num_limit",
         "echo 1400 > /sys/module/net_ext_modul/parameters/skb_max_panic",
@@ -1049,8 +1230,12 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
             "iptables -F -t nat".to_string(),
             // "iptables -t nat -A POSTROUTING -s 192.168.8.2/32 -o wan1 -j MASQUERADE",
             // format!("iptables -t nat -A POSTROUTING -s {}/32 -o wan1 -j MASQUERADE", ip_only),
+            // format!(
+            //     "iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j SNAT --to-source {}",
+            //     ip_only, wan1_ip
+            // ),
             format!(
-                "iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j SNAT --to-source {}",
+                "iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j NETMAP --to {}",
                 ip_only, wan1_ip
             ),
             //&format!("iptables -t nat -A POSTROUTING -s {} -o wan1 -j MASQUERADE", br_network),
@@ -1142,15 +1327,9 @@ fn check_connectivity(target_ip: &str, is_prod: bool) -> (bool, Option<std::time
 fn tcp_connect_check(target_ip: &str, is_prod: bool) -> bool {
     use std::net::TcpStream;
 
-    let start = Instant::now();
-
     match TcpStream::connect_timeout(&target_ip.parse().unwrap(), CONNECT_TIMEOUT) {
         Ok(stream) => {
             drop(stream);
-            // let _duration = start.elapsed();
-            // if !is_prod {
-            //     // log_message(&format!("TCP connect successful, took {:?}", duration.as_millis()), is_prod);
-            // }
             true
         }
         Err(e) => {
@@ -1268,75 +1447,6 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
     log_message("adbd force restarted successfully", is_prod);
     let _ = re_enable_adb_function(is_prod);
     Ok(())
-}
-
-fn force_restart_radvd_process(target_ip: &str, is_prod: bool) {
-    //radvd -d 3 -C /etc_rw/radvd_wan1.conf -p /tmp/radvd_wan1.pid
-    // 启动新的 radvd 进程
-    match Command::new("radvd")
-        .args([
-            "-d",
-            "1",
-            "-C",
-            "/etc_rw/radvd_wan1.conf",
-            "-p",
-            "/tmp/radvd_wan1.pid",
-            "-n",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            let parent_pid = child.id();
-            log_message(
-                &format!(
-                    "✅ radvd restarted successfully, parent pid: {}",
-                    parent_pid
-                ),
-                is_prod,
-            );
-            send_udp_notification("RADVD_RESTARTED", target_ip.to_string(), is_prod);
-
-            // 等待 radvd fork 完成
-            thread::sleep(Duration::from_millis(1000));
-
-            // if let Ok(entries) = fs::read_dir("/proc") {
-            //     for entry in entries.flatten() {
-            //         let file_name = entry.file_name();
-            //         let name_str = file_name.to_string_lossy();
-
-            //         if name_str.chars().all(|c| c.is_ascii_digit()) {
-            //             let cmdline_path = format!("/proc/{}/cmdline", name_str);
-            //             if let Ok(cmdline_content) = fs::read_to_string(&cmdline_path) {
-            //                 if cmdline_content.contains("radvd") {
-            //                     // 修复：将 Cow<'_, str> 转换为 String
-            //                     let pid = name_str.to_string();
-
-            //                     if pid.parse::<u32>().unwrap_or(0) != parent_pid {
-            //                         // 杀死adbd进程
-            //                         let _ = Command::new("kill")
-            //                             //.arg("-9")
-            //                             .arg(&pid)
-            //                             .status();
-            //                         log_message(
-            //                             &format!("force Killed process (PID: {})", pid),
-            //                             is_prod,
-            //                         );
-            //                     }
-            //                 }
-            //             }
-            //         }
-            //     }
-            // }
-
-            // 分离子进程，让它在后台运行
-            // let _ = child.wait();
-        }
-        Err(e) => {
-            log_message(&format!("❌ Failed to restart radvd: {}", e), is_prod);
-        }
-    }
 }
 
 pub fn force_start_goahead_process(is_prod: bool) -> Result<(), String> {
@@ -1498,3 +1608,182 @@ fn re_enable_adb_function(is_prod: bool) -> Result<(), String> {
     log_message("ADB function re-enabled, USB now in ECM+ADB mode", is_prod);
     Ok(())
 }
+
+/// 尝试从单个SNTP服务器同步时间
+fn try_sntp_server(server: &str) -> Result<(u64, String), String> {
+    // SNTP请求包: 48字节
+    // LI (2位) + VN (3位) + Mode (3位) = 0x1B
+    // LI = 0 (无闰秒), VN = 3 (版本), Mode = 3 (客户端)
+    let mut request = [0u8; 48];
+    request[0] = 0x1B; // LI=0, VN=3, Mode=3
+
+    // 创建UDP socket
+    let socket =
+        UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
+
+    socket
+        .set_read_timeout(Some(SNTP_TIMEOUT))
+        .map_err(|e| format!("Failed to set read timeout: {}", e))?;
+    socket
+        .set_write_timeout(Some(SNTP_TIMEOUT))
+        .map_err(|e| format!("Failed to set write timeout: {}", e))?;
+
+    // 发送请求
+    socket
+        .send_to(&request, server)
+        .map_err(|e| format!("Failed to send SNTP request: {}", e))?;
+
+    // 接收响应
+    let mut response = [0u8; 48];
+    let (size, _) = socket
+        .recv_from(&mut response)
+        .map_err(|e| format!("Failed to receive SNTP response: {}", e))?;
+
+    if size < 48 {
+        return Err("Invalid SNTP response size".to_string());
+    }
+
+    // 验证响应
+    let leap_indicator = (response[0] >> 6) & 0x03;
+    let version = (response[0] >> 3) & 0x07;
+    let mode = response[0] & 0x07;
+
+    if version != 3 && version != 4 {
+        return Err(format!("Unsupported SNTP version: {}", version));
+    }
+
+    if mode != 4 && mode != 5 {
+        return Err(format!("Invalid server mode: {}", mode));
+    }
+
+    if leap_indicator == 3 {
+        return Err("Server clock not synchronized".to_string());
+    }
+
+    // 提取传输时间戳 (字节 32-35: 整数部分, 字节 36-39: 小数部分)
+    let seconds_since_1900 =
+        u32::from_be_bytes([response[32], response[33], response[34], response[35]]) as u64;
+
+    // SNTP时间起点是1900年1月1日，Unix时间是1970年1月1日
+    // 差值: 1900-1970 = 70年 = 2208988800秒
+    const NTP_UNIX_DIFF: u64 = 2208988800;
+
+    let unix_seconds = seconds_since_1900.saturating_sub(NTP_UNIX_DIFF);
+
+    Ok((unix_seconds, server.to_string()))
+}
+
+/// SNTP时间同步（支持多服务器）
+/// 返回: (时间字符串, 与当前系统时间的偏移秒数, 使用的服务器)
+fn sntp_sync_time(is_prod: bool) -> Result<(String, i64, String), String> {
+    let mut last_error = String::new();
+
+    // 尝试所有服务器，直到成功
+    for server in SNTP_SERVERS {
+        match try_sntp_server(server) {
+            Ok((unix_seconds, server_used)) => {
+                // 计算与当前系统时间的偏移
+                let current_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| format!("Failed to get current time: {}", e))?
+                    .as_secs() as i64;
+
+                let offset = unix_seconds as i64 - current_time;
+
+                // 如果时间偏差超过5秒，则调整系统时间
+                if offset.abs() > 5 {
+                    log_message(
+                        &format!(
+                            "Time offset too large ({}s), adjusting system time...",
+                            offset
+                        ),
+                        is_prod,
+                    );
+
+                    // 使用libc::settimeofday设置系统时间
+                    unsafe {
+                        let tv = libc::timeval {
+                            tv_sec: unix_seconds as libc::time_t,
+                            tv_usec: 0,
+                        };
+
+                        // 第二个参数在Linux中已被废弃，传null即可
+                        if libc::settimeofday(&tv, std::ptr::null()) != 0 {
+                            let err = io::Error::last_os_error();
+                            return Err(format!("settimeofday failed: {}", err));
+                        }
+                    }
+                }
+
+                // 格式化时间字符串 (UTC)
+                // let time_str = format_unix_time(unix_seconds);
+
+                return Ok((unix_seconds.to_string(), offset, server_used));
+            }
+            Err(e) => {
+                last_error = format!("{}: {}", server, e);
+                if !is_prod {
+                    log_message(&format!("SNTP server {} failed: {}", server, e), is_prod);
+                }
+                // 继续尝试下一个服务器
+                continue;
+            }
+        }
+    }
+
+    // 所有服务器都失败
+    Err(format!(
+        "All SNTP servers failed. Last error: {}",
+        last_error
+    ))
+}
+
+// /// 将Unix时间戳格式化为可读字符串
+// fn format_unix_time(unix_seconds: u64) -> String {
+//     // 简单的日期格式化 (不需要chrono crate)
+//     const DAYS_IN_MONTH: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+//     let mut days = unix_seconds / 86400;
+//     let rem_seconds = unix_seconds % 86400;
+
+//     let hour = (rem_seconds / 3600) as u8;
+//     let minute = ((rem_seconds % 3600) / 60) as u8;
+//     let second = (rem_seconds % 60) as u8;
+
+//     // 1970年1月1日起始
+//     let mut year = 1970u32;
+
+//     loop {
+//         let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+//         if days < days_in_year {
+//             break;
+//         }
+//         days -= days_in_year;
+//         year += 1;
+//     }
+
+//     let mut month = 1u8;
+//     while month <= 12 {
+//         let dim = if month == 2 && is_leap_year(year) {
+//             29
+//         } else {
+//             DAYS_IN_MONTH[(month - 1) as usize] as u64
+//         };
+//         if days < dim {
+//             break;
+//         }
+//         days -= dim;
+//         month += 1;
+//     }
+
+//     let day = (days + 1) as u8;
+
+//     format!(
+//         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+//         year, month, day, hour, minute, second
+//     )
+// }
+
+// fn is_leap_year(year: u32) -> bool {
+//     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+// }
