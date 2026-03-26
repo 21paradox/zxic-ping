@@ -4,7 +4,7 @@ use std::fs::{self};
 use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::net::{SocketAddr, TcpListener};
-// use std::os::unix::io::AsRawFd;
+use std::os::unix::io::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -18,9 +18,9 @@ mod radvd; // 声明模块
 
 const DEFAULT_TARGET_IP: &str = "127.0.0.1:80";
 const PING_INTERVAL: u64 = 60; // 网络检查间隔60秒
-const SNAT_CHECK_INTERVAL: u64 = 300; // CPU检查间隔30秒
+const SNAT_CHECK_INTERVAL: u64 = 300;
 const DNS_CONFIG_CHECK_INTERVAL: u64 = 300; // DNS配置检查间隔120秒
-const RADVD_PREFIX_CHECK_INTERVAL: u64 = 120; // CPU检查间隔30秒
+const RADVD_PREFIX_CHECK_INTERVAL: u64 = 120;
 const SNTP_SYNC_INTERVAL: u64 = 3600; // SNTP同步间隔1小时
 const SNTP_TIMEOUT: Duration = Duration::from_secs(5); // SNTP超时时间
 const SNTP_SERVERS: &[&str] = &[
@@ -77,7 +77,7 @@ const MEMORY_MONITOR_INTERVAL: Duration = Duration::from_secs(6); // 内存检�
 fn handle_restart_adb(target_ip: &str, is_prod: bool) {
     match force_restart_adbd_process(is_prod) {
         Ok(_) => {
-            log_message("✅ adbd force restarted successfully", is_prod);
+            log_message("adbd force restarted successfully", is_prod);
             send_udp_notification("ADBD_FORCE_RESTARTED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
@@ -89,7 +89,7 @@ fn handle_restart_adb(target_ip: &str, is_prod: bool) {
 fn handle_kill_adb(target_ip: &str, is_prod: bool) {
     match force_kill_process(is_prod, "adbd") {
         Ok(_) => {
-            log_message("✅ adbd killed successfully", is_prod);
+            log_message("adbd killed successfully", is_prod);
             send_udp_notification("ADBD_FORCE_KILLED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
@@ -105,7 +105,7 @@ fn handle_restart_server(is_prod: bool) {
 fn handle_disable_adb(target_ip: &str, is_prod: bool) {
     match disable_adb_function(is_prod) {
         Ok(_) => {
-            log_message("✅ adb function disabled successfully", is_prod);
+            log_message("adb function disabled successfully", is_prod);
             send_udp_notification("ADB_FUNCTION_DISABLED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
@@ -120,7 +120,7 @@ fn handle_disable_adb(target_ip: &str, is_prod: bool) {
 fn handle_restart_goahead(target_ip: &str, is_prod: bool) {
     match force_start_goahead_process(is_prod) {
         Ok(_) => {
-            log_message("✅ goahead force restarted successfully", is_prod);
+            log_message("goahead force restarted successfully", is_prod);
             send_udp_notification("GOAHEAD_FORCE_RESTARTED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
@@ -247,7 +247,7 @@ fn handle_reduce_kernel_load(target_ip: &str, is_prod: bool) {
 fn handle_kill_goahead(target_ip: &str, is_prod: bool) {
     match force_kill_process(is_prod, "goahead") {
         Ok(_) => {
-            log_message("✅ goahead killed successfully", is_prod);
+            log_message("goahead killed successfully", is_prod);
             send_udp_notification("GOAHEAD_KILLED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
@@ -260,7 +260,7 @@ fn handle_kill_radvd(target_ip: &str, is_prod: bool) {
     let _ = force_kill_process(is_prod, "dhcp6s");
     match force_kill_process(is_prod, "radvd") {
         Ok(_) => {
-            log_message("✅ radvd killed successfully", is_prod);
+            log_message("radvd killed successfully", is_prod);
             send_udp_notification("RADVD_KILLED", target_ip.to_string(), is_prod);
         }
         Err(e) => {
@@ -451,13 +451,13 @@ fn main() {
         println!("Network monitor started for {}", target_ip);
         println!("Network check interval: {} seconds", PING_INTERVAL);
         println!("Reboot after {} consecutive failures", MAX_FAILURES);
-        println!("Usage: {} [TARGET_IP] [--background] [--isprod]", args[0]);
+        println!("Usage: {} [TARGET_IP:PORT] [--background] [--isprod]", args[0]);
     }
 
     let target_sock_ip = match target_ip.parse::<SocketAddr>() {
         Ok(sock) => sock.ip().to_string(),
         Err(_) => {
-            log_message(&format!("invalid target_ip: {}", target_ip), is_prod);
+            log_message(&format!("invalid target_ip:PORT: {}", target_ip), is_prod);
             return;
         }
     };
@@ -466,12 +466,28 @@ fn main() {
         is_prod,
     );
 
+    let wan1_ip_check = get_wan_ip_address(is_prod);
+    if wan1_ip_check.is_empty() {
+        return
+    }
+
     // 创建内存监控器（极简设计，无线程）
     let mut memory_monitor = MemoryMonitor::new();
 
-    // 启动信号监听
-    let signal_listener =
-        TcpListener::bind(("0.0.0.0", SIGNAL_LISTEN_PORT)).expect("bind signal port");
+    // 启动信号监听（同时支持 IPv4 和 IPv6）
+    let signal_listener = TcpListener::bind(("::", SIGNAL_LISTEN_PORT)).expect("bind signal port");
+    // 设置 IPV6_V6ONLY 为 false，允许 IPv4 映射到 IPv6
+    let socket_fd = signal_listener.as_raw_fd();
+    unsafe {
+        let opt: libc::c_int = 0;
+        libc::setsockopt(
+            socket_fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &opt as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
     signal_listener
         .set_nonblocking(true)
         .expect("set_nonblocking");
@@ -480,6 +496,7 @@ fn main() {
     let mut high_latency_count = 0;
     let mut last_network_check = Instant::now();
     let mut last_snat_check = Instant::now();
+    let mut current_snat_wan_ip = String::new();
     // let mut last_udp_notification = Instant::now();
     // let mut last_adbd_check = Instant::now();
     // let mut last_log_prune = Instant::now();
@@ -489,12 +506,18 @@ fn main() {
         Instant::now() - Duration::from_secs(RADVD_PREFIX_CHECK_INTERVAL + 1);
     // SNTP同步时间检查
     let mut last_sntp_check = Instant::now() - Duration::from_secs(SNTP_SYNC_INTERVAL + 1);
+    // usblan0状态检查（处理USB热插拔）
+    let mut last_usblan_check = Instant::now();
 
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
     let _ = force_kill_process(is_prod, "dnsmasq");
     let _ = force_kill_process(is_prod, "dhcp6s");
     let _ = force_kill_process(is_prod, "radvd");
+
+    let _ = Command::new("nv").args(["set", "default_wan_rel="]).status();
+    let _ = Command::new("nv").args(["set", "default_wan6_rel="]).status();
+
 
     // 检查 /etc/resolv.conf，如果为空或最后一行是 nameserver 127.0.0.1，则追加 DNS
     match fs::read_to_string("/etc/resolv.conf") {
@@ -542,6 +565,8 @@ fn main() {
         }
         Err(_) => String::new(),
     };
+    let radvd_iface_name = "br0";
+
     if lan_enable == "0" && need_jilian == "0" {
         log_message("LanEnable=0 and need_jilian=0, configuring bridge...", is_prod);
         let _ = Command::new("brctl").args(["addbr", "br0"]).status();
@@ -591,6 +616,7 @@ fn main() {
         }
     };
     let mut radvd_conf_option = None;
+    let mut current_radvd_pfx = String::new();
 
     loop {
         let now = Instant::now();
@@ -599,7 +625,11 @@ fn main() {
             >= Duration::from_secs(RADVD_PREFIX_CHECK_INTERVAL)
         {
             let new_pfx = radvd::get_radvd_prefix();
-            if !new_pfx.is_empty() {
+            if !new_pfx.is_empty() && new_pfx != current_radvd_pfx {
+                // 前缀发生变化，执行更新
+                log_message(&format!("radvd prefix changed: {} -> {}", current_radvd_pfx, new_pfx), is_prod);
+                current_radvd_pfx = new_pfx.clone();
+
                 match radvd_conf_option.as_mut() {
                     Some(radvd_conf) => {
                         // 更新现有配置
@@ -609,16 +639,51 @@ fn main() {
                     }
                     None => {
                         // 创建新配置并初始化
-                        let mut new_conf = radvd::create_radvd_config(&new_pfx);
+                        let mut new_conf = radvd::create_radvd_config(&new_pfx, radvd_iface_name);
                         if let Some(icmp_socket) = &icmp_socket_option {
                             radvd::setup_radvd(&mut new_conf, icmp_socket);
                         }
                         radvd_conf_option = Some(new_conf);
                     }
                 }
+
+                // 同时更新 br0 的 IPv6 地址（复制569行的逻辑）
+                let ipv6_addr = format!("{}2/64", new_pfx);
+                log_message(&format!("Updating IPv6 address {} to br0", ipv6_addr), is_prod);
+                let _ = Command::new("ip").args(["addr", "add", &ipv6_addr, "dev", "br0"]).status();
             }
 
             last_radvdprefix_check = now;
+        }
+
+        // 定期检查 usblan0 状态（处理USB热插拔）
+        if now.duration_since(last_usblan_check) >= Duration::from_secs(20) {
+            // 检查 usblan0 是否在 br0 网桥中
+            let in_bridge = match Command::new("brctl").args(["show"]).output() {
+                Ok(output) => {
+                    if output.status.success() {
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|line| line.contains("usblan0"))
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            };
+            
+            if !in_bridge {
+                log_message("usblan0 not in br0, re-adding...", is_prod); 
+                // 重新加入网桥
+                let _ = Command::new("brctl").args(["addif", "br0", "usblan0"]).status();
+                thread::sleep(Duration::from_millis(1000));
+
+                let _ = Command::new("ip").args(["link", "set", "usblan0", "up"]).status();
+                let _ = Command::new("ifconfig").args(["br0", "up"]).status();
+                let _ = Command::new("ifconfig").args(["usblan0", "up"]).status();
+            }
+            
+            last_usblan_check = now;
         }
 
         // 处理 radvd socket（使用迭代器避免嵌套if let）
@@ -646,46 +711,46 @@ fn main() {
 
                         if received == RESTART_SIGNAL_ADBD {
                             log_message(
-                                &format!("📨 Received restart signal from {}", addr),
+                                &format!("Received restart signal from {}", addr),
                                 is_prod,
                             );
                             handle_restart_adb(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == KILL_SIGNAL_ADBD {
-                            log_message(&format!("📨 Received kill signal from {}", addr), is_prod);
+                            log_message(&format!("Received kill signal from {}", addr), is_prod);
                             handle_kill_adb(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == DISABLE_ADB {
                             log_message(
-                                &format!("📨 Received disable adb signal from {}", addr),
+                                &format!("Received disable adb signal from {}", addr),
                                 is_prod,
                             );
                             handle_disable_adb(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == RESTART_SIGNAL_SERVER {
                             log_message(
-                                &format!("📨 Received reboot signal from {}", addr),
+                                &format!("Received reboot signal from {}", addr),
                                 is_prod,
                             );
                             handle_restart_server(is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == RESTART_SIGNAL_GOAHEAD {
                             log_message(
-                                &format!("📨 Received restart goahead signal from {}", addr),
+                                &format!("Received restart goahead signal from {}", addr),
                                 is_prod,
                             );
                             handle_restart_goahead(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == REDUCE_KERNEL_LOAD {
                             log_message(
-                                &format!("📨 Received reduce kernel load signal from {}", addr),
+                                &format!("Received reduce kernel load signal from {}", addr),
                                 is_prod,
                             );
                             handle_reduce_kernel_load(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == ENABLE_MEMORY_MONITOR {
                             log_message(
-                                &format!("📨 Received enable memory monitor signal from {}", addr),
+                                &format!("Received enable memory monitor signal from {}", addr),
                                 is_prod,
                             );
                             memory_monitor.enable(is_prod);
@@ -697,7 +762,7 @@ fn main() {
                             let _ = stream.write_all(b"OK");
                         } else if received == DISABLE_MEMORY_MONITOR {
                             log_message(
-                                &format!("📨 Received disable memory monitor signal from {}", addr),
+                                &format!("Received disable memory monitor signal from {}", addr),
                                 is_prod,
                             );
                             memory_monitor.disable(is_prod);
@@ -711,21 +776,21 @@ fn main() {
                             let _ = stream.write_all(b"OK");
                         } else if received == KILL_SIGNAL_RADVD {
                             log_message(
-                                &format!("📨 Received kill radvd signal from {}", addr),
+                                &format!("Received kill radvd signal from {}", addr),
                                 is_prod,
                             );
                             handle_kill_radvd(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == ADJUST_ZRAM {
                             log_message(
-                                &format!("📨 Received adjust zram signal from {}", addr),
+                                &format!("Received adjust zram signal from {}", addr),
                                 is_prod,
                             );
                             handle_adjust_zram(&target_ip, is_prod);
                             let _ = stream.write_all(b"OK");
                         } else if received == KILL_SIGNAL_GOAHEAD {
                             log_message(
-                                &format!("📨 Received kill goahead signal from {}", addr),
+                                &format!("Received kill goahead signal from {}", addr),
                                 is_prod,
                             );
                             handle_kill_goahead(&target_ip, is_prod);
@@ -758,53 +823,39 @@ fn main() {
         }
 
         if now.duration_since(last_snat_check) >= Duration::from_secs(SNAT_CHECK_INTERVAL) {
-            let br_network = get_br_network(is_prod);
             let wan1_ip = get_wan_ip_address(is_prod);
 
-            if !br_network.is_empty() && !wan1_ip.is_empty() {
-                // 检查当前第一条规则是否包含正确的 WAN IP
-                let check_cmd = "iptables -t nat -L POSTROUTING 1";
-                let needs_update = match Command::new("sh").arg("-c").arg(check_cmd).output() {
-                    Ok(output) => {
-                        if output.status.success() {
-                            let current_rule = String::from_utf8_lossy(&output.stdout);
-                            // 检查规则是否包含正确的 WAN IP
-                            let expected_pattern = format!("to:{}", wan1_ip);
-                            !current_rule.contains(&expected_pattern)
-                        } else {
-                            // 如果获取规则失败，假定需要更新
-                            true
+            if !wan1_ip.is_empty() && wan1_ip != current_snat_wan_ip {
+                // 先添加新规则到第一行（确保新规则立即生效，对运行系统影响最小）
+                let source = format!("{}/32", target_sock_ip);
+                if Command::new("iptables")
+                    .args(["-t", "nat", "-I", "POSTROUTING", "-s", &source, "-o", "wan1", "-j", "NETMAP", "--to", &wan1_ip])
+                    .status()
+                    .is_ok()
+                {
+                    log_message(
+                        &format!("SNAT rule added: {} -> {}", target_sock_ip, wan1_ip),
+                        is_prod,
+                    );
+                    
+                    // 新规则添加成功后，删除旧规则（如果有）
+                    if !current_snat_wan_ip.is_empty() {
+                        if Command::new("iptables")
+                            .args(["-t", "nat", "-D", "POSTROUTING", "-s", &source, "-o", "wan1", "-j", "NETMAP", "--to", &current_snat_wan_ip])
+                            .status()
+                            .is_ok()
+                        {
+                            log_message(
+                                &format!("Old SNAT rule deleted: {} -> {}", target_sock_ip, current_snat_wan_ip),
+                                is_prod,
+                            );
                         }
                     }
-                    Err(_) => {
-                        // 如果执行命令失败，假定需要更新
-                        true
-                    }
-                };
-
-                if needs_update {
-                    let ipt_cmds = [
-                        format!("iptables -t nat -I POSTROUTING -s {}/32 -o wan1 -j NETMAP --to {}", target_sock_ip, wan1_ip),
-                        "iptables -t nat -D POSTROUTING 2".to_string(),
-                    ];
-
-                    for cmd in &ipt_cmds {
-                        if let Err(e) = Command::new("sh").arg("-c").arg(cmd).status() {
-                            if !is_prod {
-                                log_message(
-                                    &format!("Failed to adjust network parameter {}: {}", cmd, e),
-                                    is_prod,
-                                );
-                            }
-                        }
-                    }
-
-                    if !is_prod {
-                        log_message(
-                            &format!("SNAT rule updated with new WAN IP: {}", wan1_ip),
-                            is_prod,
-                        );
-                    }
+                    
+                    // 更新当前记录的 WAN IP
+                    current_snat_wan_ip = wan1_ip;
+                } else {
+                    log_message(&format!("Failed to add SNAT rule to {}", wan1_ip), is_prod);
                 }
             }
             last_snat_check = now;
@@ -1017,10 +1068,10 @@ fn reset_android_usb(_is_prod: bool) {
 
 fn throttle_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
-    if let Err(e) = std::fs::write("/proc/sys/net/nf_conntrack_max", b"3500\n") {
+    if let Err(e) = std::fs::write("/proc/sys/net/nf_conntrack_max", b"4096\n") {
         if !is_prod {
             log_message(
-                &format!("Failed to adjust nf_conntrack_max to 3500: {}", e),
+                &format!("Failed to adjust nf_conntrack_max to 4096: {}", e),
                 is_prod,
             );
         }
@@ -1030,10 +1081,10 @@ fn throttle_network_parameters(is_prod: bool) {
 fn restore_network_parameters(is_prod: bool) {
     // 调整TCP参数来减轻网络栈负担
     thread::sleep(Duration::from_millis(200));
-    if let Err(e) = std::fs::write("/proc/sys/net/nf_conntrack_max", b"4096\n") {
+    if let Err(e) = std::fs::write("/proc/sys/net/nf_conntrack_max", b"8192\n") {
         if !is_prod {
             log_message(
-                &format!("Failed to adjust nf_conntrack_max to 4096: {}", e),
+                &format!("Failed to adjust nf_conntrack_max to 8192: {}", e),
                 is_prod,
             );
         }
@@ -1066,35 +1117,35 @@ fn get_wan_ip_address(is_prod: bool) -> String {
     String::new()
 }
 
-fn get_br_network(is_prod: bool) -> String {
-    // 获取 br0 接口的网络地址 (如 192.168.0.0/24)
-    if let Ok(output) = Command::new("ip")
-        .args(["route", "show", "dev", "br0"])
-        .output()
-    {
-        if output.status.success() {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            for line in output_str.lines() {
-                let parts: Vec<&str> = line.trim().split_whitespace().collect();
-                // 查找类似 "192.168.0.0/24" 的网络路由
-                if parts.len() >= 1 && parts[0].contains('/') {
-                    let network = parts[0];
-                    if network != "default" && !network.starts_with("169.254") {
-                        // log_message(&format!("Found br0 network: {}", network), is_prod);
-                        return network.to_string();
-                    }
-                }
-            }
-        }
-    }
+// fn get_br_network(is_prod: bool) -> String {
+//     // 获取 br0 接口的网络地址 (如 192.168.0.0/24)
+//     if let Ok(output) = Command::new("ip")
+//         .args(["route", "show", "dev", "br0"])
+//         .output()
+//     {
+//         if output.status.success() {
+//             let output_str = String::from_utf8_lossy(&output.stdout);
+//             for line in output_str.lines() {
+//                 let parts: Vec<&str> = line.trim().split_whitespace().collect();
+//                 // 查找类似 "192.168.0.0/24" 的网络路由
+//                 if parts.len() >= 1 && parts[0].contains('/') {
+//                     let network = parts[0];
+//                     if network != "default" && !network.starts_with("169.254") {
+//                         // log_message(&format!("Found br0 network: {}", network), is_prod);
+//                         return network.to_string();
+//                     }
+//                 }
+//             }
+//         }
+//     }
 
-    // 如果无法获取网络地址，使用默认的 192.168.0.0/24
-    log_message(
-        "Could not determine br0 network, using default 192.168.0.0/24",
-        is_prod,
-    );
-    "192.168.0.0/24".to_string()
-}
+//     // 如果无法获取网络地址，使用默认的 192.168.0.0/24
+//     log_message(
+//         "Could not determine br0 network, using default 192.168.0.0/24",
+//         is_prod,
+//     );
+//     "192.168.0.0/24".to_string()
+// }
 
 fn optimize_network_parameters(is_prod: bool, addr: String) {
     // 调整TCP参数来减轻网络栈负担
@@ -1105,7 +1156,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
             return;
         }
     };
-    let br_network = get_br_network(is_prod);
+    // let br_network = get_br_network(is_prod);
     let wan1_ip = get_wan_ip_address(is_prod);
 
     let commands = [
@@ -1128,7 +1179,8 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
 
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout",
         "echo 10 > /proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout_stream",
-        "echo 4096 > /proc/sys/net/nf_conntrack_max",
+        "echo 2048 > /sys/module/nf_conntrack/parameters/hashsize",
+        "echo 8192 > /proc/sys/net/nf_conntrack_max",
         "echo 450 > /proc/sys/net/netfilter/nf_conntrack_expect_max",
         // "echo 0 > /proc/sys/net/netfilter/nf_conntrack_log_invalid",
         // "echo 0 > /proc/sys/net/netfilter/nf_conntrack_checksum",
@@ -1221,7 +1273,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
         "echo 500 > /sys/devices/platform/zx29_hsotg.0/gadget/net/usblan0/queues/tx-0/byte_queue_limits/hold_time"
     ];
 
-    if !br_network.is_empty() && !wan1_ip.is_empty() {
+    if !wan1_ip.is_empty() {
         let ipt_cmds = [
             "iptables -P INPUT ACCEPT".to_string(),
             "iptables -P FORWARD ACCEPT".to_string(),
@@ -1241,7 +1293,7 @@ fn optimize_network_parameters(is_prod: bool, addr: String) {
             //&format!("iptables -t nat -A POSTROUTING -s {} -o wan1 -j MASQUERADE", br_network),
             "ip6tables -F".to_string(),
             "ifconfig wan1 txqueuelen 100".to_string(),
-            "ifconfig br0 txqueuelen 500".to_string(),
+            // "ifconfig br0 txqueuelen 500".to_string(),
             "ifconfig usblan0 txqueuelen 500".to_string(),
         ];
         for cmd in &ipt_cmds {
@@ -1531,7 +1583,7 @@ fn disable_adb_function(is_prod: bool) -> Result<(), String> {
     log_message("Disabling ADB function via USB configuration...", is_prod);
     match force_kill_process(is_prod, "adbd") {
         Ok(_) => {
-            log_message("✅ adbd killed successfully", is_prod);
+            log_message("adbd killed successfully", is_prod);
         }
         Err(e) => {
             log_message(&format!("❌ Failed to kill adbd: {}", e), is_prod);
@@ -1660,9 +1712,9 @@ fn try_sntp_server(server: &str) -> Result<(u64, String), String> {
         return Err("Server clock not synchronized".to_string());
     }
 
-    // 提取传输时间戳 (字节 32-35: 整数部分, 字节 36-39: 小数部分)
+    // 提取传输时间戳 (Transmit Timestamp: 字节 40-43: 整数部分, 字节 44-47: 小数部分)
     let seconds_since_1900 =
-        u32::from_be_bytes([response[32], response[33], response[34], response[35]]) as u64;
+        u32::from_be_bytes([response[40], response[41], response[42], response[43]]) as u64;
 
     // SNTP时间起点是1900年1月1日，Unix时间是1970年1月1日
     // 差值: 1900-1970 = 70年 = 2208988800秒

@@ -8,11 +8,11 @@ use radvd_core::socket::IcmpV6Socket;
 use radvd_core::timer::{expired, reschedule_iface, touch_iface};
 use radvd_core::util::rand_between;
 
-pub fn create_radvd_config(prefix_addr: &str) -> Config {
+pub fn create_radvd_config(prefix_addr: &str, iface_name: &str) -> Config {
     use radvd_core::config::Interface;
 
     let mut iface = Interface::default();
-    iface.props.name = "br0".to_string();
+    iface.props.name = iface_name.to_string();
     iface.adv_send_advert = true;
     iface.ra_header_info.adv_other_config_flag = false;
     iface.min_rtr_adv_interval = 30.0;
