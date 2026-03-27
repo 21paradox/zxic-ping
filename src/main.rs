@@ -396,7 +396,112 @@ impl MemoryMonitor {
 //     proctitle::set_title(name);
 // }
 
+/// 热插拔事件日志路径
+// const HOTPLUG_LOG_PATH: &str = "/etc_rw/hotplug.log";
+
+/// 检测并处理热插拔事件
+/// 当程序被注册为 /proc/sys/kernel/hotplug 处理器时，内核会通过环境变量传递事件
+fn handle_hotplug_event() -> bool {
+    // 检查热插拔相关的环境变量
+    let action = env::var("ACTION").ok();
+    let devpath = env::var("DEVPATH").ok();
+    let subsystem = env::var("SUBSYSTEM").ok();
+    let seqnum = env::var("SEQNUM").ok();
+
+    // 如果没有热插拔环境变量，说明是正常启动
+    if action.is_none() && devpath.is_none() && subsystem.is_none() {
+        return false;
+    }
+
+    // 构建日志内容
+    // let timestamp = SystemTime::now()
+    //     .duration_since(UNIX_EPOCH)
+    //     .unwrap_or_default()
+    //     .as_secs();
+    
+    // let log_entry = format!(
+    //     "[{}] ACTION={} DEVPATH={} SUBSYSTEM={} SEQNUM={}\n",
+    //     timestamp,
+    //     action.as_deref().unwrap_or("-"),
+    //     devpath.as_deref().unwrap_or("-"),
+    //     subsystem.as_deref().unwrap_or("-"),
+    //     seqnum.as_deref().unwrap_or("-")
+    // );
+
+    // let _ = fs::OpenOptions::new()
+    //     .create(true)
+    //     .append(true)
+    //     .open(HOTPLUG_LOG_PATH)
+    //     .and_then(|mut f| f.write_all(log_entry.as_bytes()));
+
+    // 处理 usblan0 上线事件
+    let action_str = action.as_deref().unwrap_or("");
+    let devpath_str = devpath.as_deref().unwrap_or("");
+    let subsystem_str = subsystem.as_deref().unwrap_or("");
+    
+    if action_str == "online" && devpath_str.contains("usblan0") && subsystem_str == "net" {
+        // 检查是否为桥接模式
+        let lan_enable = Command::new("nv")
+            .args(["get", "LanEnable"])
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
+            .unwrap_or_default();
+        
+        let need_jilian = Command::new("nv")
+            .args(["get", "need_jilian"])
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
+            .unwrap_or_default();
+        
+        if lan_enable == "0" && need_jilian == "0" {
+            // 检查 usblan0 是否在 br0 网桥中
+            let in_bridge = match Command::new("brctl").args(["show"]).output() {
+                Ok(output) => {
+                    if output.status.success() {
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|line| line.contains("usblan0"))
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            };
+            
+            if !in_bridge {
+                // let _ = fs::OpenOptions::new()
+                //     .create(true)
+                //     .append(true)
+                //     .open(HOTPLUG_LOG_PATH)
+                //     .and_then(|mut f| f.write_all(b"[hotplug] usblan0 not in br0, re-adding...\n"));
+                
+                // 重新加入网桥
+                let _ = Command::new("brctl").args(["addif", "br0", "usblan0"]).status();
+                // thread::sleep(Duration::from_millis(1000));
+                let _ = Command::new("ip").args(["link", "set", "usblan0", "up"]).status();
+                let _ = Command::new("ifconfig").args(["br0", "up"]).status();
+                let _ = Command::new("ifconfig").args(["usblan0", "up"]).status();
+                
+                // let _ = fs::OpenOptions::new()
+                //     .create(true)
+                //     .append(true)
+                //     .open(HOTPLUG_LOG_PATH)
+                //     .and_then(|mut f| f.write_all(b"[hotplug] usblan0 re-added to br0 done\n"));
+            }
+        }
+    }
+
+    true
+}
+
 fn main() {
+    // 首先检查是否为热插拔事件调用
+    if handle_hotplug_event() {
+        return;
+    }
+
     // 设置进程名
     // set_process_name("ztedm_timer");
 
@@ -506,8 +611,6 @@ fn main() {
         Instant::now() - Duration::from_secs(RADVD_PREFIX_CHECK_INTERVAL + 1);
     // SNTP同步时间检查
     let mut last_sntp_check = Instant::now() - Duration::from_secs(SNTP_SYNC_INTERVAL + 1);
-    // usblan0状态检查（处理USB热插拔）
-    let mut last_usblan_check = Instant::now();
 
     thread::sleep(Duration::from_secs(30));
     optimize_network_parameters(is_prod, target_ip.clone());
@@ -568,6 +671,9 @@ fn main() {
     let radvd_iface_name = "br0";
 
     if lan_enable == "0" && need_jilian == "0" {
+        // 注册自己为热插拔处理器
+        let _ = std::fs::write("/proc/sys/kernel/hotplug", b"/etc_rw/zxic_ping\n");
+
         log_message("LanEnable=0 and need_jilian=0, configuring bridge...", is_prod);
         let _ = Command::new("brctl").args(["addbr", "br0"]).status();
         let _ = Command::new("brctl").args(["stp", "br0", "off"]).status();
@@ -656,35 +762,6 @@ fn main() {
             last_radvdprefix_check = now;
         }
 
-        // 定期检查 usblan0 状态（处理USB热插拔）
-        if now.duration_since(last_usblan_check) >= Duration::from_secs(20) {
-            // 检查 usblan0 是否在 br0 网桥中
-            let in_bridge = match Command::new("brctl").args(["show"]).output() {
-                Ok(output) => {
-                    if output.status.success() {
-                        String::from_utf8_lossy(&output.stdout)
-                            .lines()
-                            .any(|line| line.contains("usblan0"))
-                    } else {
-                        false
-                    }
-                }
-                Err(_) => false,
-            };
-            
-            if !in_bridge {
-                log_message("usblan0 not in br0, re-adding...", is_prod); 
-                // 重新加入网桥
-                let _ = Command::new("brctl").args(["addif", "br0", "usblan0"]).status();
-                thread::sleep(Duration::from_millis(1000));
-
-                let _ = Command::new("ip").args(["link", "set", "usblan0", "up"]).status();
-                let _ = Command::new("ifconfig").args(["br0", "up"]).status();
-                let _ = Command::new("ifconfig").args(["usblan0", "up"]).status();
-            }
-            
-            last_usblan_check = now;
-        }
 
         // 处理 radvd socket（使用迭代器避免嵌套if let）
         if let (Some(icmp_socket), Some(radvd_conf)) =
@@ -1475,9 +1552,9 @@ fn force_restart_adbd_process(is_prod: bool) -> Result<(), String> {
     thread::sleep(Duration::from_secs(3));
 
     // 3. 启动新的adbd进程
-    let child = Command::new("/bin/adbd")
-        .stdout(Stdio::null()) // 标准输出重定向到 /dev/null
-        .stderr(Stdio::null()) // 标准错误重定向到 /dev/null
+    let child = Command::new("/etc_rw/adbd")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to start adbd: {}", e))?;
 
