@@ -406,7 +406,7 @@ fn handle_hotplug_event() -> bool {
     let action = env::var("ACTION").ok();
     let devpath = env::var("DEVPATH").ok();
     let subsystem = env::var("SUBSYSTEM").ok();
-    let seqnum = env::var("SEQNUM").ok();
+    // let seqnum = env::var("SEQNUM").ok();
 
     // 如果没有热插拔环境变量，说明是正常启动
     if action.is_none() && devpath.is_none() && subsystem.is_none() {
