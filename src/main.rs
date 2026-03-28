@@ -677,7 +677,6 @@ fn main() {
         log_message("LanEnable=0 and need_jilian=0, configuring bridge...", is_prod);
         let _ = Command::new("brctl").args(["addbr", "br0"]).status();
         let _ = Command::new("brctl").args(["stp", "br0", "off"]).status();
-        let _ = Command::new("brctl").args(["addif", "br0", "wan1"]).status();
         let _ = Command::new("brctl").args(["addif", "br0", "usblan0"]).status();
         let _ = Command::new("ifconfig").args(["br0", "up"]).status();
         let _ = Command::new("ifconfig").args(["usblan0", "up"]).status();
